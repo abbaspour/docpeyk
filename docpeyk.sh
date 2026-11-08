@@ -2,26 +2,31 @@
 
 set -ueo pipefail
 
-DIR="${BASH_SOURCE[0]%/*}"
-[ "$DIR" = "${BASH_SOURCE[0]}" ] && DIR="."
-readonly DIR
+#DIR="${BASH_SOURCE[0]%/*}"
+#[ "$DIR" = "${BASH_SOURCE[0]}" ] && DIR="."
+#readonly DIR
+
+readonly VERSION="0.1.0"
 
 function usage() {
     cat <<END >&2
-USAGE: $0 [-d dir] [-f slug] [-C|-S] [-v|-h]
+USAGE: $0 [-d dir] [-f slug] [-C|-S] [-v|-V|-h]
        $0 [-d dir] [-a author] [-C] [-v] URL...
+       $0 [-d dir] -D
         -d dir         # data directory (default ~/Kindle)
         -f slug        # only process the feed with this slug
         -a author      # author for ad-hoc URLs (default: the page's byline)
         -C             # convert only, don't send
         -S             # send only, don't fetch/convert
+        -D             # doctor: check tools, settings, feeds, mail and schedule, then exit
+        -V             # print version
         -h|?           # usage
         -v             # verbose
 
 Without URLs: reads <dir>/feeds.csv (feed_url,author,slug), converts every unseen
-post to <dir>/<slug>/new/*.epub and mails up to MAX_SENDS_PER_RUN files from new/
+post to <dir>/<slug>/outbox/*.epub and mails up to MAX_SENDS_PER_RUN files from outbox/
 to Kindle, moving sent files to <dir>/<slug>/sent/.
-With URLs: converts each page to <dir>/adhoc/new/ and sends it right away.
+With URLs: converts each page to <dir>/adhoc/outbox/ and sends it right away.
 Settings live in <dir>/kindle.conf.
 
 eg,
@@ -29,11 +34,19 @@ eg,
      $0 -f jvns -C
      $0 https://example.com/some-post/
      $0 -a "Paul Graham" https://paulgraham.com/greatwork.html
+     $0 -D
 END
     exit $1
 }
 
-function log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >&2; }
+# log lines go to ${LOG_FILE} and, unless stderr already is that file (launchd/cron), to stderr
+declare -i log_echo=1
+function log() {
+    local line
+    line="$(date '+%F %T') $*"
+    printf '%s\n' "${line}" >> "${LOG_FILE}"
+    [[ ${log_echo} -eq 0 ]] || printf '%s\n' "${line}" >&2
+}
 function vlog() { [[ ${opt_verbose} -eq 1 ]] && log "$@"; return 0; }
 
 declare ROOT="${HOME}/Kindle"
@@ -42,14 +55,17 @@ declare adhoc_author=''
 declare -i opt_convert=1
 declare -i opt_send=1
 declare -i opt_verbose=0
+declare -i opt_doctor=0
 
-while getopts ":d:f:a:CShv?" opt; do
+while getopts ":d:f:a:CSDVhv?" opt; do
     case ${opt} in
     d) ROOT=${OPTARG} ;;
     f) only_slug=${OPTARG} ;;
     a) adhoc_author=${OPTARG} ;;
     C) opt_send=0 ;;
     S) opt_convert=0 ;;
+    D) opt_doctor=1 ;;
+    V) echo "docpeyk ${VERSION}"; exit 0 ;;
     v) opt_verbose=1 ;;
     h) usage 0 ;;
     \?) [[ "${OPTARG}" == "?" ]] && usage 0
@@ -60,20 +76,28 @@ while getopts ":d:f:a:CShv?" opt; do
 done
 shift $((OPTIND - 1))
 declare -a adhoc_urls=("$@")
-readonly ROOT only_slug adhoc_author opt_convert opt_send opt_verbose adhoc_urls
+readonly ROOT only_slug adhoc_author opt_convert opt_send opt_verbose opt_doctor adhoc_urls
 
 for u in ${adhoc_urls[@]+"${adhoc_urls[@]}"}; do
     [[ "${u}" =~ ^https?:// ]] || { echo >&2 "ERROR: not an http(s) URL: ${u}"; usage 1; }
 done
 [[ ${#adhoc_urls[@]} -gt 0 && ${opt_convert} -eq 0 ]] && { echo >&2 "ERROR: -S can't be combined with URLs"; usage 1; }
+[[ ${#adhoc_urls[@]} -gt 0 && ${opt_doctor} -eq 1 ]] && { echo >&2 "ERROR: -D can't be combined with URLs"; usage 1; }
 
 readonly FEEDS="${ROOT}/feeds.csv"
 readonly CONF="${ROOT}/kindle.conf"
 readonly LOCK="${ROOT}/.lock"
+readonly LOG_FILE="${ROOT}/docpeyk.log"
 readonly ADHOC="adhoc"
+readonly USER_AGENT="docpeyk/${VERSION} (+https://github.com/abbaspour/docpeyk)"
 
 # ---- bootstrap data directory ----------------------------------------------------------
 mkdir -p "${ROOT}"
+touch "${LOG_FILE}"
+# same device and inode as the open stderr? (bash's -ef can't see through /dev/stderr on macOS)
+perl -e 'my @e = stat STDERR; my @f = stat shift; exit !(@e && @f && $e[0] == $f[0] && $e[1] == $f[1])' \
+    "${LOG_FILE}" && log_echo=0
+readonly log_echo
 [[ -f "${FEEDS}" ]] || cat > "${FEEDS}" <<'EOL'
 # feed_url,author,slug  -- one feed per line, no commas inside fields, '#' lines are ignored
 # https://jvns.ca/atom.xml,Julia Evans,jvns
@@ -85,6 +109,7 @@ MSMTP_ACCOUNT="default" # account in ~/.msmtprc (its 'from' must be approved in 
 SEND_DELAY=30           # seconds to wait between emails
 MAX_SENDS_PER_RUN=5     # emails per scheduled run; the rest wait for the next run
 MAX_ATTEMPTS=3          # give up converting a post after this many failures
+MAX_POSTS_PER_FEED=10   # only the newest posts of each feed are converted; 0 means all
 # extra percollate flags; covers are rendered with headless Chrome, so they are off by default
 # (to enable: npx puppeteer browsers install chrome, then set PERCOLLATE_ARGS=())
 PERCOLLATE_ARGS=(--no-cover)
@@ -95,15 +120,175 @@ declare MSMTP_ACCOUNT='default'
 declare -i SEND_DELAY=30
 declare -i MAX_SENDS_PER_RUN=5
 declare -i MAX_ATTEMPTS=3
+declare -i MAX_POSTS_PER_FEED=10
 declare -a PERCOLLATE_ARGS=(--no-cover)
 # shellcheck source=/dev/null
 . "${CONF}"
 
-command -v curl >/dev/null || { echo >&2 "error: curl not found"; exit 3; }
-command -v jq >/dev/null   || { echo >&2 "error: jq not found";   exit 3; }
-command -v yq >/dev/null   || { echo >&2 "error: yq not found";   exit 3; }
-[[ ${opt_convert} -eq 1 ]] && { command -v percollate >/dev/null || { echo >&2 "error: percollate not found"; exit 3; }; }
-[[ ${opt_send} -eq 1 ]]    && { command -v msmtp >/dev/null      || { echo >&2 "error: msmtp not found";      exit 3; }; }
+# ---- checks shared by runs and the doctor ----------------------------------------------
+# where install.sh schedules us; keep in sync with install.sh
+readonly LABEL="io.github.abbaspour.docpeyk"
+readonly MARKER="# docpeyk (managed by install.sh)"
+
+# dependency_problems  -> one line per missing or unusable tool this run needs
+function dependency_problems() {
+    local tool
+    for tool in curl jq yq perl openssl unzip; do
+        command -v "${tool}" >/dev/null || echo "${tool} not found"
+    done
+    # Debian, Ubuntu and Arch package a different, Python-based tool as "yq" that can't read XML like this
+    if command -v yq >/dev/null && [[ "$(yq --version 2>&1)" != *mikefarah* ]]; then
+        echo "yq is not mikefarah/yq, install it from https://github.com/mikefarah/yq"
+    fi
+    # core perl, but packaged separately on some distros (Fedora/RHEL: perl-Unicode-Normalize)
+    if command -v perl >/dev/null && ! perl -MUnicode::Normalize -e 1 2>/dev/null; then
+        echo "perl module Unicode::Normalize not found"
+    fi
+    if [[ ${opt_convert} -eq 1 ]] && ! command -v percollate >/dev/null; then echo "percollate not found"; fi
+    if [[ ${opt_send} -eq 1 ]] && ! command -v msmtp >/dev/null; then echo "msmtp not found"; fi
+    return 0
+}
+
+# percollate's requirement
+function node_version_ok() {
+    local v major minor
+    v=$(node -p 'process.versions.node' 2>/dev/null) || return 1
+    major=${v%%.*}
+    minor=${v#*.}
+    minor=${minor%%.*}
+    [[ ${major} -gt 14 || (${major} -eq 14 && ${minor} -ge 17) ]]
+}
+
+# is there a route out? local checks only: macOS scutil, else Linux iproute2, else assume yes
+function network_up() {
+    if command -v scutil >/dev/null; then
+        [[ "$(scutil -r 1.1.1.1 2>/dev/null)" == Reachable* ]]
+    elif command -v ip >/dev/null; then
+        ip route get 1.1.1.1 >/dev/null 2>&1
+    fi
+}
+
+function trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
+
+# read_feeds <reporter>  -> "url <US> author <US> slug" for each valid feeds.csv line;
+# <reporter> (a command) gets one message per invalid line
+function read_feeds() {
+    local f_url f_author f_slug f_extra
+    local -i lineno=0
+    while IFS=, read -r f_url f_author f_slug f_extra || [[ -n "${f_url}" ]]; do
+        lineno+=1
+        f_url=$(trim "${f_url}")
+        [[ -z "${f_url}" || "${f_url}" == \#* ]] && continue
+        f_author=$(trim "${f_author:-}")
+        f_slug=$(trim "${f_slug:-}")
+        if [[ -n "${f_extra:-}" || -z "${f_author}" || ! "${f_slug}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            "$1" "feeds.csv:${lineno}: expected 'feed_url,author,slug', skipping"
+            continue
+        fi
+        printf '%s\x1f%s\x1f%s\n' "${f_url}" "${f_author}" "${f_slug}"
+    done < "${FEEDS}"
+}
+
+# ---- doctor ----------------------------------------------------------------------------
+declare -i doctor_fails=0
+
+# report <ok|warn|FAIL> <message...>
+function report() {
+    printf '%-5s %s\n' "$1" "${*:2}"
+    if [[ "$1" == FAIL ]]; then doctor_fails+=1; fi
+    return 0
+}
+# warnings from inside $(...), sent to the doctor's stdout on fd 3
+function report_warn_fd3() { report warn "$@" >&3; }
+
+function doctor() {
+    local problems line cfg host from feeds dupes
+    local -i scheduled=0
+    echo "docpeyk ${VERSION}, data in ${ROOT}"
+
+    problems=$(dependency_problems)
+    if [[ -z "${problems}" ]]; then
+        report ok "tools: curl jq yq perl openssl unzip percollate msmtp"
+    else
+        while IFS= read -r line; do report FAIL "${line}"; done <<< "${problems}"
+    fi
+    if command -v percollate >/dev/null; then
+        if ! command -v node >/dev/null; then report FAIL "node not found; percollate needs Node >= 14.17"
+        elif ! node_version_ok; then report FAIL "percollate needs Node >= 14.17, found $(node --version)"
+        else report ok "node $(node --version) for $(command -v percollate)"; fi
+    fi
+
+    if [[ -z "${KINDLE_TO}" ]]; then
+        report FAIL "KINDLE_TO is not set in ${CONF}"
+    elif [[ "${KINDLE_TO}" =~ @(free\.)?kindle\.(com|cn)$ ]]; then
+        report ok "KINDLE_TO ${KINDLE_TO}"
+    else
+        report warn "KINDLE_TO ${KINDLE_TO} doesn't look like a Send to Kindle address (...@kindle.com)"
+    fi
+
+    if command -v msmtp >/dev/null; then
+        # only host and from are read; the rest of this output can hold credentials.
+        # On failure msmtp prints just its error (unknown account, config readable by others, ...)
+        if ! cfg=$(msmtp -P -a "${MSMTP_ACCOUNT}" </dev/null 2>&1); then
+            report FAIL "$(grep -m1 '^msmtp: ' <<< "${cfg}" || echo "msmtp can't use account '${MSMTP_ACCOUNT}' (MSMTP_ACCOUNT)")"
+        else
+            host=$(sed -n 's/^host = //p' <<< "${cfg}")
+            from=$(sed -n 's/^from = //p' <<< "${cfg}")
+            if [[ -n "${from}" ]]; then
+                report ok "msmtp account ${MSMTP_ACCOUNT}: host ${host:-?}, from ${from}"
+                report ok "  (${from} must be on Amazon's Approved Personal Document E-mail List)"
+            else
+                report warn "msmtp account ${MSMTP_ACCOUNT} has no 'from'; set it to an address Amazon approves"
+            fi
+            if ! network_up; then
+                report warn "no network: SMTP server not checked"
+            elif msmtp -S -a "${MSMTP_ACCOUNT}" </dev/null >/dev/null 2>&1; then
+                report ok "SMTP server ${host:-?} answers"
+            else
+                report FAIL "SMTP server ${host:-?} doesn't answer; details: msmtp -S -a ${MSMTP_ACCOUNT}"
+            fi
+        fi
+    fi
+
+    { feeds=$(read_feeds report_warn_fd3); } 3>&1
+    if [[ -z "${feeds}" ]]; then
+        report warn "no feeds in ${FEEDS} yet; findfeed.sh -c <blog url> >> ${FEEDS} adds one"
+    else
+        report ok "feeds.csv: $(grep -c . <<< "${feeds}") feed(s)"
+        dupes=$(cut -d $'\x1f' -f3 <<< "${feeds}" | sort | uniq -d | paste -sd, -)
+        [[ -z "${dupes}" ]] || report warn "feeds.csv: slug used more than once: ${dupes}"
+        if cut -d $'\x1f' -f3 <<< "${feeds}" | grep -qx "${ADHOC}"; then
+            report warn "feeds.csv: '${ADHOC}' is reserved for ad-hoc pages; pick another slug"
+        fi
+    fi
+
+    if command -v launchctl >/dev/null && launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
+        report ok "scheduled with launchd (${LABEL})"
+        scheduled=1
+    fi
+    if command -v crontab >/dev/null && [[ "$(crontab -l 2>/dev/null)" == *"${MARKER}"* ]]; then
+        report ok "scheduled with cron"
+        scheduled=1
+    fi
+    [[ ${scheduled} -eq 1 ]] || report warn "not scheduled; install.sh sets up launchd (macOS) or cron"
+
+    echo
+    if [[ ${doctor_fails} -eq 0 ]]; then
+        echo "all good. Send any page to test delivery end to end: $0 <url>"
+    else
+        echo "${doctor_fails} problem(s) to fix"
+    fi
+    [[ ${doctor_fails} -eq 0 ]]
+}
+
+if [[ ${opt_doctor} -eq 1 ]]; then
+    doctor && exit 0
+    exit 1
+fi
+
+problems=$(dependency_problems)
+readonly problems
+[[ -z "${problems}" ]] || { sed 's/^/error: /' <<< "${problems}" >&2; exit 3; }
 
 # ---- locking ---------------------------------------------------------------------------
 # take_lock <dir>: mkdir-based lock holding our pid; clears locks left behind by dead processes
@@ -122,7 +307,7 @@ readonly work
 trap 'rm -rf ${held_locks[@]+"${held_locks[@]}"} "${work}"' EXIT
 
 # ad-hoc runs skip the global lock so they never wait behind a long scheduled run;
-# sending is serialised per folder in send_new instead
+# sending is serialised per folder in send_outbox instead
 if [[ ${#adhoc_urls[@]} -eq 0 ]]; then
     if ! take_lock "${LOCK}"; then
         log "another run is in progress (pid $(cat "${LOCK}/pid")), exiting"
@@ -135,13 +320,11 @@ fi
 function wait_for_network() {
     local -i i
     for ((i = 0; i < 12; i++)); do
-        [[ "$(scutil -r 1.1.1.1 2>/dev/null)" == Reachable* ]] && return 0
+        network_up && return 0
         sleep 5
     done
     return 1
 }
-
-function trim() { local s="$1"; s="${s#"${s%%[![:space:]]*}"}"; printf '%s' "${s%"${s##*[![:space:]]}"}"; }
 
 # "Café: Über Title!" -> "cafe-uber-title"  (empty for titles with no latin letters/digits)
 function slugify() {
@@ -149,7 +332,8 @@ function slugify() {
         s/[^a-z0-9]+/-/g; s/^-+//; $_ = substr($_, 0, 80); s/-+$//; print' "$1"
 }
 
-function short_hash() { printf '%s' "$1" | shasum | cut -c1-8; }
+# first 8 hex digits of the SHA-1; awk takes the last field of both OpenSSL and LibreSSL output
+function short_hash() { printf '%s' "$1" | openssl dgst -sha1 | awk '{ print substr($NF, 1, 8) }'; }
 
 # percollate exits 0 even when it couldn't fetch the page, leaving an EPUB with only nav.xhtml
 function has_article() { unzip -Z1 "$1" 2>/dev/null | awk '/^OEBPS\/.*\.xhtml$/ && !/\/nav\.xhtml$/ { f = 1 } END { exit !f }'; }
@@ -159,6 +343,58 @@ function opf_field() {
     { unzip -p "$1" '*.opf' 2>/dev/null || true; } | tr '\n' ' ' \
         | sed -n "s|.*<dc:$2[^>]*>\([^<]*\)</dc:$2>.*|\1|p" \
         | sed -e 's/&lt;/</g' -e 's/&gt;/>/g' -e 's/&quot;/"/g' -e "s/&apos;/'/g" -e "s/&#39;/'/g" -e 's/&amp;/\&/g'
+}
+
+# ---- feed parsing ----------------------------------------------------------------------
+# jq program that normalises RSS 2.0, RSS 1.0 (RDF) and Atom feeds (as JSON from
+# `yq -p xml -o json`) into one line per post:  id <US> link <US> title <US> YYYY-MM-DD
+# where <US> is the ASCII unit separator (\u001f).
+# Kept in a function rather than $(cat <<...) so bash 3.2 doesn't trip over its quotes.
+function feed_items_jq() {
+    cat <<'EOL'
+def arr: if . == null then [] elif type == "array" then . else [.] end;
+
+# element text: yq yields a plain string, or an object with "+content" when the element has attributes
+def txt: if type == "object" then (.["+content"] // "") elif . == null then "" else tostring end;
+
+def unhtml:
+  gsub("<[^>]*>"; "")
+  | gsub("&#(?<n>[0-9]+);"; [.n | tonumber] | implode)
+  | gsub("&#x(?<n>[0-9a-fA-F]+);"; ([.n | ascii_downcase | explode[] | if . >= 97 then . - 87 else . - 48 end]
+                                     | reduce .[] as $d (0; . * 16 + $d)) as $c | [$c] | implode)
+  | gsub("&quot;"; "\"") | gsub("&apos;"; "'") | gsub("&lt;"; "<") | gsub("&gt;"; ">")
+  | gsub("&nbsp;"; " ") | gsub("&amp;"; "&");
+
+def clean: gsub("[\\s\u001f]+"; " ") | ltrimstr(" ") | rtrimstr(" ");
+
+# RFC 822 ("Mon, 02 Jan 2006 ...") or ISO 8601 ("2006-01-02T...") -> "2006-01-02"; "" if unknown
+def ymd:
+  if test("^[0-9]{4}-[0-9]{2}-[0-9]{2}") then .[0:10]
+  else ([capture("(?<d>[0-9]{1,2})\\s+(?<m>[A-Za-z]{3})[A-Za-z]*\\.?\\s+(?<y>[0-9]{4})")][0]) as $c
+    | ({"jan":"01","feb":"02","mar":"03","apr":"04","may":"05","jun":"06",
+        "jul":"07","aug":"08","sep":"09","oct":"10","nov":"11","dec":"12"}[$c.m // "" | ascii_downcase]) as $m
+    | if $c and $m then "\($c.y)-\($m)-\($c.d | if length == 1 then "0" + . else . end)" else "" end
+  end;
+
+# Atom <link href=".."/>: prefer rel="alternate" (or no rel), else the first one
+def atomlink: arr | (map(select(type == "object" and (.["+@rel"] == null or .["+@rel"] == "alternate")))[0]["+@href"])
+                    // (.[0] | if type == "object" then .["+@href"] else txt end) // "";
+
+(
+  (.rss.channel.item | arr | .[]
+    | {id: (.guid | txt), link: (.link | arr | .[0] | txt), title: (.title | txt), date: ((.pubDate // .["dc:date"]) | txt)}),
+  (.feed.entry | arr | .[]
+    | {id: (.id | txt), link: (.link | atomlink), title: (.title | txt), date: ((.published // .updated) | txt)}),
+  (.["rdf:RDF"].item | arr | .[]
+    | {id: (.["+@rdf:about"] // "" | txt), link: (.link | txt), title: (.title | txt), date: (.["dc:date"] | txt)})
+)
+| .link |= clean
+| select(.link | test("^https?://"))
+| .id = ((.id | clean) as $i | if $i == "" then .link else $i end)
+| .title = (.title | unhtml | clean | if . == "" then "Untitled" else . end)
+| [.id, .link, .title, (.date | clean | ymd)]
+| join("\u001f")
+EOL
 }
 
 # ---- convert ---------------------------------------------------------------------------
@@ -176,7 +412,8 @@ function convert_url() {
     if ! percollate epub ${PERCOLLATE_ARGS[@]+"${PERCOLLATE_ARGS[@]}"} ${meta[@]+"${meta[@]}"} \
             -o "${tmp_epub}" "${link}" </dev/null >"${work}/percollate.log" 2>&1 \
         || ! has_article "${tmp_epub}"; then
-        grep -v '^ *at ' "${work}/percollate.log" | head -10 | sed 's/^/    /' >&2
+        { grep -v '^ *at ' "${work}/percollate.log" || true; } | head -10 \
+            | while IFS= read -r line; do log "    ${line}"; done
         return 1
     fi
 
@@ -194,10 +431,24 @@ function convert_url() {
     name=$(slugify "${title}")
     [[ -n "${name}" ]] || name=$(short_hash "${link}")
     name="${day}-${name}"
-    [[ -e "${base}/new/${name}.epub" || -e "${base}/sent/${name}.epub" ]] && name="${name}-$(short_hash "${link}")"
-    out="${base}/new/${name}.epub"
+    [[ -e "${base}/outbox/${name}.epub" || -e "${base}/sent/${name}.epub" ]] && name="${name}-$(short_hash "${link}")"
+    out="${base}/outbox/${name}.epub"
     mv "${tmp_epub}" "${out}"
     printf '%s\n' "${out}"
+}
+
+# newest_posts <items file> <n>  -> its n newest lines, in feed order. Newest is by date when every
+# post has one, else the first n (feeds list newest first by convention). The sort goes to a file,
+# not a pipe into head, so an early-closing pipe can't fail the run under pipefail.
+function newest_posts() {
+    local sorted="$1.sorted"
+    if [[ $(wc -l < "$1") -le $2 ]] || ! awk -F $'\x1f' '$4 == "" { exit 1 }' "$1"; then
+        head -n "$2" "$1"
+        return 0
+    fi
+    # number the lines, keep the n latest dates (field 5 once numbered), then restore feed order
+    awk -v OFS=$'\x1f' '{ print NR, $0 }' "$1" | LC_ALL=C sort -s -t $'\x1f' -k5,5r -o "${sorted}"
+    head -n "$2" "${sorted}" | LC_ALL=C sort -t $'\x1f' -k1,1n | cut -d $'\x1f' -f2-
 }
 
 # convert_feed <feed_url> <author> <slug>
@@ -209,18 +460,22 @@ function convert_feed() {
     local id link title day
     local -i n_new=0
 
-    mkdir -p "${base}/new" "${base}/sent"
+    mkdir -p "${base}/outbox" "${base}/sent"
     touch "${seen}" "${failed}"
 
-    if ! curl -fsSL --max-time 60 --retry 3 --retry-delay 10 -A 'docpeyk-kindle (+percollate)' -o "${xml}" "${url}"; then
+    if ! curl -fsSL --max-time 60 --retry 3 --retry-delay 10 -A "${USER_AGENT}" -o "${xml}" "${url}"; then
         log "[${slug}] failed to fetch feed ${url}"
         return 0
     fi
-    if ! yq -p xml -o json "${xml}" | jq -r -f "${DIR}/feed-items.jq" > "${items}"; then
+    if ! yq -p xml -o json "${xml}" | jq -r "$(feed_items_jq)" > "${items}"; then
         log "[${slug}] failed to parse feed ${url}"
         return 0
     fi
     vlog "[${slug}] $(wc -l < "${items}" | tr -d ' ') items in feed"
+    if [[ ${MAX_POSTS_PER_FEED} -gt 0 ]]; then
+        newest_posts "${items}" "${MAX_POSTS_PER_FEED}" > "${items}.newest"
+        mv "${items}.newest" "${items}"
+    fi
 
     while IFS=$'\x1f' read -r id link title day; do
         grep -qxF -- "${id}" "${seen}" && continue
@@ -293,12 +548,12 @@ EOL
     printf '\n--%s--\n' "${boundary}"
 }
 
-# emails left in this run's budget (MAX_SENDS_PER_RUN), shared by all capped send_new calls
+# emails left in this run's budget (MAX_SENDS_PER_RUN), shared by all capped send_outbox calls
 declare -i sends_left=${MAX_SENDS_PER_RUN}
 
-# send_new <slug> <capped 0|1>
+# send_outbox <slug> <capped 0|1>  -> mails <slug>/outbox/*.epub, moving each to sent/
 # capped (scheduled) sends skip a folder another process is sending; uncapped (ad-hoc) ones wait for it
-function send_new() {
+function send_outbox() {
     local slug="$1" capped="$2"
     local base="${ROOT}/${slug}" epub title lock="${ROOT}/${slug}/.sending"
     local -i size tries=0
@@ -313,7 +568,7 @@ function send_new() {
     done
     held_locks+=("${lock}")
 
-    for epub in "${base}/new/"*.epub; do
+    for epub in "${base}/outbox/"*.epub; do
         [[ -e "${epub}" ]] || continue
         [[ ${capped} -eq 1 && ${sends_left} -le 0 ]] && break
         size=$(wc -c < "${epub}")
@@ -346,38 +601,31 @@ fi
 
 if [[ ${#adhoc_urls[@]} -gt 0 ]]; then
     declare -i rc=0
-    mkdir -p "${ROOT}/${ADHOC}/new" "${ROOT}/${ADHOC}/sent"
+    mkdir -p "${ROOT}/${ADHOC}/outbox" "${ROOT}/${ADHOC}/sent"
     for u in "${adhoc_urls[@]}"; do
         convert_url "${u}" '' "${adhoc_author}" '' "${ROOT}/${ADHOC}" >/dev/null \
             || { log "[${ADHOC}] failed to convert ${u}"; rc=1; }
     done
     if [[ ${opt_send} -eq 1 ]]; then
         [[ -n "${KINDLE_TO}" ]] || { log "KINDLE_TO is not set in ${CONF}, not sending"; exit 1; }
-        send_new "${ADHOC}" 0
-        compgen -G "${ROOT}/${ADHOC}/new/*.epub" >/dev/null && rc=1
+        send_outbox "${ADHOC}" 0
+        compgen -G "${ROOT}/${ADHOC}/outbox/*.epub" >/dev/null && rc=1
     fi
     exit ${rc}
 fi
 
 declare -a slugs=()
-declare -i lineno=0
-while IFS=, read -r f_url f_author f_slug f_extra || [[ -n "${f_url}" ]]; do
-    lineno+=1
-    f_url=$(trim "${f_url}")
-    [[ -z "${f_url}" || "${f_url}" == \#* ]] && continue
-    f_author=$(trim "${f_author:-}")
-    f_slug=$(trim "${f_slug:-}")
-    if [[ -n "${f_extra:-}" || -z "${f_author}" || ! "${f_slug}" =~ ^[A-Za-z0-9._-]+$ ]]; then
-        log "feeds.csv:${lineno}: expected 'feed_url,author,slug', skipping"
-        continue
-    fi
+feed_list=$(read_feeds log)
+readonly feed_list
+while IFS=$'\x1f' read -r f_url f_author f_slug; do
+    [[ -n "${f_url}" ]] || continue
     [[ -n "${only_slug}" && "${f_slug}" != "${only_slug}" ]] && continue
     slugs+=("${f_slug}")
     if [[ ${opt_convert} -eq 1 ]]; then convert_feed "${f_url}" "${f_author}" "${f_slug}"; fi
-done < "${FEEDS}"
+done <<< "${feed_list}"
 
 # ad-hoc pages whose immediate send failed are retried by the scheduled run
-[[ -z "${only_slug}" && -d "${ROOT}/${ADHOC}/new" ]] && slugs+=("${ADHOC}")
+[[ -z "${only_slug}" && -d "${ROOT}/${ADHOC}/outbox" ]] && slugs+=("${ADHOC}")
 
 [[ ${#slugs[@]} -eq 0 ]] && { vlog "no feeds configured in ${FEEDS}"; exit 0; }
 
@@ -385,9 +633,9 @@ if [[ ${opt_send} -eq 1 ]]; then
     if [[ -z "${KINDLE_TO}" ]]; then
         log "KINDLE_TO is not set in ${CONF}, not sending"
     else
-        for s in $(printf '%s\n' "${slugs[@]}" | sort -u); do send_new "${s}" 1; done
+        for s in $(printf '%s\n' "${slugs[@]}" | sort -u); do send_outbox "${s}" 1; done
         if [[ ${sends_left} -le 0 ]]; then
-            left=$(find "${ROOT}" -path '*/new/*.epub' | wc -l | tr -d ' ')
+            left=$(find "${ROOT}" -path '*/outbox/*.epub' | wc -l | tr -d ' ')
             [[ ${left} -gt 0 ]] && log "send limit of ${MAX_SENDS_PER_RUN} reached, ${left} file(s) wait for the next run"
         fi
     fi
