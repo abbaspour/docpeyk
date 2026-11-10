@@ -174,6 +174,8 @@ SEND_DELAY=30             # seconds between emails
 MAX_SENDS_PER_RUN=5       # emails per scheduled run; the rest wait for the next hour
 MAX_ATTEMPTS=3            # give up on a post after this many failed conversions
 MAX_POSTS_PER_FEED=10     # only the newest posts of each feed; 0 means all
+SUMMARY_TO=""             # your own address for a daily summary; empty means off
+SUMMARY_HOUR=8            # the summary goes out with the first run at or after this hour
 PERCOLLATE_ARGS=(--no-cover)  # extra percollate flags (see Covers below)
 ```
 
@@ -258,6 +260,33 @@ Send any web page right away, without adding a feed:
   process at a time, so nothing is emailed twice.
 - `adhoc` is reserved; don't use it as a slug in `feeds.csv`.
 
+## Daily summary
+
+Set `SUMMARY_TO` in `kindle.conf` to your own address (not the Kindle's) to get one email a
+day, sent through the same msmtp account:
+
+```
+Subject: docpeyk: 2 sent, 3 queued
+
+docpeyk summary since 2026-11-09 08:12
+
+  sent  queued  feed
+     2       0  Julia Evans (jvns)
+     0       3  Joel Spolsky (joel)
+     2       3  total
+```
+
+- **When:** the first scheduled run at or after `SUMMARY_HOUR` (local time, default 8) mails
+  it, once a day. There's no separate schedule: if the computer was asleep, the run on wake
+  sends it.
+- **Sent** counts posts mailed to the Kindle since the previous summary, so a few days asleep
+  are covered by one summary rather than lost. The first summary covers the last 24 hours.
+  **Queued** is what's waiting in each `outbox/`.
+- Every feed gets a row, and a day without new posts still gets a summary, with zeros.
+  Ad-hoc pages get a row when there were any.
+- If the summary can't be sent, the next hourly run tries again.
+- `./docpeyk.sh -R` prints the summary that would go out now, without mailing it.
+
 ## Layout
 
 ```
@@ -265,6 +294,7 @@ Send any web page right away, without adding a feed:
 ├── feeds.csv
 ├── kindle.conf
 ├── docpeyk.log              # log of every run, scheduled or by hand
+├── .summary                 # day of the last daily summary; its mtime ends the window
 ├── adhoc/{outbox,sent}/     # ad-hoc pages
 └── <slug>/
     ├── outbox/              # converted, not yet sent
@@ -315,6 +345,7 @@ tail -f ~/Kindle/docpeyk.log                                   # watch
 ./install.sh -n                                                 # print the plist or crontab line
 ./install.sh -i 1800                                            # every 30 minutes
 ./docpeyk.sh -D                                                 # check the setup
+./docpeyk.sh -R                                                 # preview the daily summary
 ./docpeyk.sh -V                                                 # print the version
 ```
 

@@ -248,6 +248,7 @@ check "  odd KINDLE_TO is a warning" \
     reported "warn  KINDLE_TO reader@kindle.example doesn't look like a Send to Kindle address (...@kindle.com)"
 check "  msmtp account, host and from" reported "ok    msmtp account default: host smtp.example, from me@example.com"
 check "  SMTP server" reported "ok    SMTP server smtp.example answers"
+check "  summary off by default" reported "ok    daily summary off (set SUMMARY_TO in ${data}/kindle.conf to get one)"
 check "  invalid feeds.csv line" reported "warn  feeds.csv:5: expected 'feed_url,author,slug', skipping"
 check "  feed count" reported "ok    feeds.csv: 3 feed(s)"
 check "  not scheduled" reported "warn  not scheduled; install.sh sets up launchd (macOS) or cron"
@@ -279,6 +280,88 @@ unset STUB_MSMTPRC_OPEN
 check "  shows msmtp's reason, not \"account not found\"" \
     reported "FAIL  msmtp: ${HOME}/.msmtprc: contains secrets and therefore must have no more than user read/write permissions"
 check "-D with URLs is rejected" eval '! docpeyk -D https://example.com/x'
+check "-R with URLs is rejected" eval '! docpeyk -R https://example.com/x'
+
+# ---- daily summary -----------------------------------------------------------------------
+# its own data dir and mail folder, so the counts above stay as they are
+readonly summ="${scratch}/summary"
+readonly summ_mail="${scratch}/stub-summary"
+mkdir -p "${summ}" "${summ_mail}"
+touch "${summ_mail}/percollate.calls"
+printf 'file://%s,RSS Author,rss\nfile://%s,Atom Author,atom\n' \
+    "${root}/tests/fixtures/rss2.xml" "${root}/tests/fixtures/atom.xml" > "${summ}/feeds.csv"
+function summ_conf() {
+    printf 'KINDLE_TO="reader@kindle.example"\nSEND_DELAY=0\nMAX_SENDS_PER_RUN=1\nSUMMARY_HOUR=0\n%s\n' "${1:-}" > "${summ}/kindle.conf"
+}
+function summarised() { STUB_LOG="${summ_mail}" "${test_bash}" "${root}/docpeyk.sh" -d "${summ}" "$@" 2>"${scratch}/last.log"; }
+# summary mails, oldest first
+function summary_mails() { grep -lxF 'To: summary@example.net' "${summ_mail}"/mail-*.eml 2>/dev/null | sort -t- -k2n || true; }
+function summaries() { summary_mails | grep -c . || true; }
+function last_summary() { summary_mails | tail -1; }
+function in_summary() { grep -qxF -- "$1" "$(last_summary)" || { sed 's/^/     > /' "$(last_summary)"; return 1; }; }
+function row() { printf '%6d %7d  %s\n' "$@"; }
+# the last summary was mailed yesterday, an hour ago; every post sent so far is older than that
+function summary_yesterday() {
+    echo 2000-01-01 > "${summ}/.summary"
+    perl -e '$t = time - 3600; utime $t, $t, @ARGV' "${summ}/.summary"
+    find "${summ}" -path '*/sent/*.epub' -exec perl -e '$t = time - 7200; utime $t, $t, @ARGV' {} +
+}
+
+summ_conf
+check "no SUMMARY_TO: run succeeds" summarised
+check "  no summary mailed" [ "$(summaries)" = 0 ]
+check "  no summary stamp" [ ! -e "${summ}/.summary" ]
+
+summ_conf 'SUMMARY_TO="summary@example.net"'
+check "-R prints the summary" eval 'summarised -R > "${scratch}/out"'
+check "  covering the last 24 hours, per feed" grep -qxF "$(row 1 3 total)" "${scratch}/out"
+check "  mails nothing" [ "$(summaries)" = 0 ]
+check "  leaves no stamp" [ ! -e "${summ}/.summary" ]
+check "ad-hoc pages get a row once they were sent" eval 'docpeyk -R > "${scratch}/out"'
+check "  in -R output" grep -qE '^ +[0-9]+ +[0-9]+  ad-hoc pages \(adhoc\)$' "${scratch}/out"
+
+check "SUMMARY_TO set: run succeeds" summarised
+check "  one summary mailed" [ "$(summaries)" = 1 ]
+check "  plain text" in_summary 'Content-Type: text/plain; charset=UTF-8'
+check "  totals in the subject" in_summary 'Subject: docpeyk: 2 sent, 2 queued'
+check "  sends from earlier runs count" in_summary "$(row 2 0 'Atom Author (atom)')"
+check "  feeds with nothing sent get a row" in_summary "$(row 0 2 'RSS Author (rss)')"
+check "  totals" in_summary "$(row 2 2 total)"
+check "  no ad-hoc row without ad-hoc pages" eval '! grep -q ad-hoc "$(last_summary)"'
+check "  stamp holds today" [ "$(cat "${summ}/.summary")" = "${today}" ]
+check "  logged" logged "summary sent to summary@example.net: 2 sent, 2 queued"
+
+check "second run the same day succeeds" summarised
+check "  no second summary" [ "$(summaries)" = 1 ]
+
+summary_yesterday
+export STUB_MSMTP_FAIL=1
+check "summary send failure doesn't fail the run" summarised
+unset STUB_MSMTP_FAIL
+check "  logged" logged "failed to send the summary to summary@example.net, will retry next run"
+check "  stamp unchanged" [ "$(cat "${summ}/.summary")" = 2000-01-01 ]
+check "next run retries it" summarised
+check "  mailed" [ "$(summaries)" = 2 ]
+check "  only sends since the last summary count" in_summary 'Subject: docpeyk: 1 sent, 0 queued'
+
+summary_yesterday
+check "-C run succeeds" summarised -C
+check "-f run succeeds" summarised -f rss
+check "  neither mails a summary" [ "$(summaries)" = 2 ]
+check "quiet day: run succeeds" summarised
+check "  still mails a summary" [ "$(summaries)" = 3 ]
+check "  saying 0" in_summary 'Subject: docpeyk: 0 sent, 0 queued'
+check "  with a zero row per feed" in_summary "$(row 0 0 'Atom Author (atom)')"
+
+check "doctor reports the summary" doctor_run "${summ}"
+check "  address and hour" reported "ok    daily summary to summary@example.net after 00:00"
+summ_conf 'SUMMARY_TO="me@kindle.com"'
+doctor_run "${summ}" || true
+check "  a Kindle SUMMARY_TO is a warning" \
+    reported "warn  SUMMARY_TO me@kindle.com is a Kindle address; the summary is meant for your own mailbox"
+summ_conf 'SUMMARY_HOUR=24'
+check "doctor fails on SUMMARY_HOUR=24" eval '! doctor_run "${summ}"'
+check "  says why" reported "FAIL  SUMMARY_HOUR=24 is not an hour (0-23)"
 
 # ---- install.sh --------------------------------------------------------------------------
 # install <args...>: install.sh with HOME in the scratch dir and no terminal; output in ${scratch}/out
