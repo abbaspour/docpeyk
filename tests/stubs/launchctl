@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# launchctl stand-in: no agent is ever loaded, and nothing can be installed
+echo "$*" >> "${STUB_LOG}/launchctl.calls"
+[[ "${1:-}" == print ]] && { echo >&2 'Could not find service'; exit 113; }
+exit 1

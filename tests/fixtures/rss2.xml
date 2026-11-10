@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <title>RSS 2.0 fixture</title>
+    <link>https://example.com/</link>
+    <item>
+      <title>Tom &amp; Jerry&#8217;s Plan</title>
+      <link>https://example.com/tom-and-jerry</link>
+      <guid isPermaLink="false">rss-1</guid>
+      <pubDate>Tue, 03 Feb 2026 10:00:00 +0000</pubDate>
+    </item>
+    <item>
+      <title>Café: Über alles</title>
+      <link>https://example.com/cafe</link>
+      <guid>rss-2</guid>
+      <pubDate>Mon, 2 Mar 2026 08:30:00 GMT</pubDate>
+    </item>
+    <item>
+      <title>Broken page</title>
+      <link>https://example.com/fail-post</link>
+      <pubDate>Wed, 04 Mar 2026 08:30:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>

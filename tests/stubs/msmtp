@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# msmtp stand-in: saves each message as $STUB_LOG/mail-N.eml; fails when STUB_MSMTP_FAIL is set.
+# -P/-S (doctor) know one account, "default", whose from is $STUB_MSMTP_FROM; with
+# STUB_MSMTPRC_OPEN set they fail like msmtp does on a config file others can read.
+
+set -ueo pipefail
+
+echo "$*" >> "${STUB_LOG}/msmtp.calls"
+declare account=default
+declare mode=send
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -a) account=$2; shift 2 ;;
+    -P) mode=pretend; shift ;;
+    -S) mode=serverinfo; shift ;;
+    --) break ;;
+    *) shift ;;
+    esac
+done
+if [[ "${mode}" != send ]]; then
+    if [[ -n "${STUB_MSMTPRC_OPEN:-}" ]]; then
+        echo >&2 "msmtp: ${HOME}/.msmtprc: contains secrets and therefore must have no more than user read/write permissions"
+        exit 78
+    fi
+    [[ "${account}" == default ]] || { echo >&2 "msmtp: account ${account} not found in ${HOME}/.msmtprc"; exit 78; }
+    if [[ "${mode}" == pretend ]]; then
+        printf 'host = smtp.example\nfrom = %s\npassword = *\n' "${STUB_MSMTP_FROM-me@example.com}"
+    else
+        [[ -z "${STUB_SMTP_DOWN:-}" ]] || { echo >&2 "msmtp: cannot connect to smtp.example"; exit 69; }
+        echo "SMTP server at smtp.example"
+    fi
+    exit 0
+fi
+[[ -z "${STUB_MSMTP_FAIL:-}" ]] || { cat >/dev/null; exit 75; }
+declare -i n
+n=$(find "${STUB_LOG}" -name 'mail-*.eml' | wc -l)
+cat > "${STUB_LOG}/mail-$((n + 1)).eml"

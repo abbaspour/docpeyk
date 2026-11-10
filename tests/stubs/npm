@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# npm stand-in: global prefix $STUB_NPM_PREFIX; "install -g" logs the call and drops a fake binary there
+
+set -ueo pipefail
+
+readonly prefix="${STUB_NPM_PREFIX:-${STUB_LOG}/npm-global}"
+case "$* " in
+"prefix -g ") echo "${prefix}" ;;
+"install -g "*)
+    echo "$* PUPPETEER_SKIP_DOWNLOAD=${PUPPETEER_SKIP_DOWNLOAD:-}" >> "${STUB_LOG}/npm.calls"
+    mkdir -p "${prefix}/bin" "${prefix}/lib/node_modules/percollate"
+    printf '#!/usr/bin/env bash\nexit 0\n' > "${prefix}/bin/percollate"
+    chmod +x "${prefix}/bin/percollate" ;;
+*) echo >&2 "npm stub: unsupported: $*"; exit 1 ;;
+esac

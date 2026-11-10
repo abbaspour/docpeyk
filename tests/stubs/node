@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# node stand-in reporting $STUB_NODE_VERSION
+case "${1:-}" in
+--version) echo "v${STUB_NODE_VERSION:-20.11.1}" ;;
+-p) echo "${STUB_NODE_VERSION:-20.11.1}" ;;
+*) exit 1 ;;
+esac

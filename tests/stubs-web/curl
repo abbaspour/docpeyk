@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# curl stand-in for the findfeed tests: serves http(s)://<host>/<path> from
+# tests/fixtures/sites/<host>/<path>, ignoring the query. A directory serves its index.html
+# and, like a web server's redirect, reports the URL with a trailing slash, unless it holds a
+# .no-redirect marker (sites that serve "/blog" as is).
+# Supports the -o, -w '%{url_effective}' and -f options that findfeed.sh uses.
+
+set -ueo pipefail
+
+DIR="${BASH_SOURCE[0]%/*}"
+[ "$DIR" = "${BASH_SOURCE[0]}" ] && DIR="."
+readonly DIR
+
+declare out=''
+declare fmt=''
+declare url=''
+
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -o) out=$2; shift 2 ;;
+    -w) fmt=$2; shift 2 ;;
+    -A | -H | --max-time | --retry | --retry-delay) shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+    esac
+done
+
+path="${url#*://}"
+path="${path%%[?#]*}"
+file="${DIR}/../fixtures/sites/${path}"
+if [[ -d "${file}" ]]; then
+    [[ "${url}" == */ || -e "${file%/}/.no-redirect" ]] || url="${url}/"
+    file="${file%/}/index.html"
+fi
+[[ -f "${file}" ]] || { echo >&2 "curl: (22) The requested URL returned error: 404"; exit 22; }
+
+if [[ -n "${out}" ]]; then cat "${file}" > "${out}"; else cat "${file}"; fi
+[[ -z "${fmt}" ]] || printf '%s' "${url}"   # the only -w format findfeed.sh uses is %{url_effective}

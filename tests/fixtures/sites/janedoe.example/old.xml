@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<channel>
+<title>Old</title>
+<link>https://example.com/</link>
+<item><title>Post 1</title><link>https://example.com/p1</link><dc:creator><![CDATA[Jane Doe]]></dc:creator></item>
+</channel>
+</rss>

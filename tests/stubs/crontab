@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# crontab stand-in: the crontab lives in $STUB_LOG/crontab. "crontab -" truncates it before
+# reading stdin (stricter than the real one), so a caller piping crontab -l into it loses lines.
+
+set -ueo pipefail
+
+readonly file="${STUB_LOG}/crontab"
+case "${1:-}" in
+-l) [[ -f "${file}" ]] || { echo >&2 "crontab: no crontab for $(id -un)"; exit 1; }
+    cat "${file}" ;;
+-) cat > "${file}" ;;
+*) echo >&2 "crontab stub: unsupported: $*"; exit 1 ;;
+esac

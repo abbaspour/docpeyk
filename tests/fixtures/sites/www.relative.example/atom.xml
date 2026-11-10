@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <title>Notes</title>
+  <author><name>Ada Lovelace</name></author>
+  <id>urn:example:relative</id>
+  <entry><title>One</title><link href="https://www.relative.example/one"/><id>urn:1</id></entry>
+</feed>

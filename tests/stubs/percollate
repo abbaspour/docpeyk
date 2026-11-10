@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# percollate stand-in: writes a minimal EPUB without fetching anything.
+# URLs containing "fail" get an EPUB with only nav.xhtml, like a real failed fetch.
+
+set -ueo pipefail
+
+declare title='Page Title'
+declare author='Page Author'
+declare out=''
+declare url=''
+
+shift # "epub"
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    --title) title=$2; shift 2 ;;
+    --author) author=$2; shift 2 ;;
+    -o) out=$2; shift 2 ;;
+    -*) shift ;;
+    *) url=$1; shift ;;
+    esac
+done
+echo "${url}" >> "${STUB_LOG}/percollate.calls"
+
+function xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<< "$1"; }
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/percollate-stub.XXXXXX")
+readonly tmp
+mkdir -p "${tmp}/OEBPS"
+cat > "${tmp}/OEBPS/content.opf" <<EOL
+<?xml version="1.0" encoding="UTF-8"?>
+<package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+<dc:title>$(xml_escape "${title}")</dc:title>
+<dc:creator>$(xml_escape "${author}")</dc:creator>
+</metadata></package>
+EOL
+echo '<html/>' > "${tmp}/OEBPS/nav.xhtml"
+[[ "${url}" == *fail* ]] || echo '<html/>' > "${tmp}/OEBPS/article.xhtml"
+(cd "${tmp}" && zip -qr article.epub OEBPS)
+mv "${tmp}/article.epub" "${out}"
+rm -rf "${tmp}"

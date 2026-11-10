@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<channel>
+<title>Section Blog</title>
+<link>https://section.example/blog</link>
+<item><title>Post 1</title><link>https://section.example/blog/2024/05/post.html</link><dc:creator>Sam</dc:creator></item>
+</channel>
+</rss>
