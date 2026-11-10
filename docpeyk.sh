@@ -12,13 +12,14 @@ function usage() {
     cat <<END >&2
 USAGE: $0 [-d dir] [-f slug] [-C|-S] [-v|-V|-h]
        $0 [-d dir] [-a author] [-C] [-v] URL...
-       $0 [-d dir] -D
+       $0 [-d dir] -D|-R
         -d dir         # data directory (default ~/Kindle)
         -f slug        # only process the feed with this slug
         -a author      # author for ad-hoc URLs (default: the page's byline)
         -C             # convert only, don't send
         -S             # send only, don't fetch/convert
         -D             # doctor: check tools, settings, feeds, mail and schedule, then exit
+        -R             # print the daily summary that would be mailed now, then exit
         -V             # print version
         -h|?           # usage
         -v             # verbose
@@ -27,6 +28,8 @@ Without URLs: reads <dir>/feeds.csv (feed_url,author,slug), converts every unsee
 post to <dir>/<slug>/outbox/*.epub and mails up to MAX_SENDS_PER_RUN files from outbox/
 to Kindle, moving sent files to <dir>/<slug>/sent/.
 With URLs: converts each page to <dir>/adhoc/outbox/ and sends it right away.
+With SUMMARY_TO set, the first scheduled run after SUMMARY_HOUR each day mails it a summary:
+posts sent per feed since the last summary, and how many are still queued.
 Settings live in <dir>/kindle.conf.
 
 eg,
@@ -35,6 +38,7 @@ eg,
      $0 https://example.com/some-post/
      $0 -a "Paul Graham" https://paulgraham.com/greatwork.html
      $0 -D
+     $0 -R
 END
     exit $1
 }
@@ -56,8 +60,9 @@ declare -i opt_convert=1
 declare -i opt_send=1
 declare -i opt_verbose=0
 declare -i opt_doctor=0
+declare -i opt_report=0
 
-while getopts ":d:f:a:CSDVhv?" opt; do
+while getopts ":d:f:a:CSDRVhv?" opt; do
     case ${opt} in
     d) ROOT=${OPTARG} ;;
     f) only_slug=${OPTARG} ;;
@@ -65,6 +70,7 @@ while getopts ":d:f:a:CSDVhv?" opt; do
     C) opt_send=0 ;;
     S) opt_convert=0 ;;
     D) opt_doctor=1 ;;
+    R) opt_report=1 ;;
     V) echo "docpeyk ${VERSION}"; exit 0 ;;
     v) opt_verbose=1 ;;
     h) usage 0 ;;
@@ -76,18 +82,20 @@ while getopts ":d:f:a:CSDVhv?" opt; do
 done
 shift $((OPTIND - 1))
 declare -a adhoc_urls=("$@")
-readonly ROOT only_slug adhoc_author opt_convert opt_send opt_verbose opt_doctor adhoc_urls
+readonly ROOT only_slug adhoc_author opt_convert opt_send opt_verbose opt_doctor opt_report adhoc_urls
 
 for u in ${adhoc_urls[@]+"${adhoc_urls[@]}"}; do
     [[ "${u}" =~ ^https?:// ]] || { echo >&2 "ERROR: not an http(s) URL: ${u}"; usage 1; }
 done
 [[ ${#adhoc_urls[@]} -gt 0 && ${opt_convert} -eq 0 ]] && { echo >&2 "ERROR: -S can't be combined with URLs"; usage 1; }
 [[ ${#adhoc_urls[@]} -gt 0 && ${opt_doctor} -eq 1 ]] && { echo >&2 "ERROR: -D can't be combined with URLs"; usage 1; }
+[[ ${#adhoc_urls[@]} -gt 0 && ${opt_report} -eq 1 ]] && { echo >&2 "ERROR: -R can't be combined with URLs"; usage 1; }
 
 readonly FEEDS="${ROOT}/feeds.csv"
 readonly CONF="${ROOT}/kindle.conf"
 readonly LOCK="${ROOT}/.lock"
 readonly LOG_FILE="${ROOT}/docpeyk.log"
+readonly SUMMARY_STAMP="${ROOT}/.summary"
 readonly ADHOC="adhoc"
 readonly USER_AGENT="docpeyk/${VERSION} (+https://github.com/abbaspour/docpeyk)"
 
@@ -110,6 +118,8 @@ SEND_DELAY=30           # seconds to wait between emails
 MAX_SENDS_PER_RUN=5     # emails per scheduled run; the rest wait for the next run
 MAX_ATTEMPTS=3          # give up converting a post after this many failures
 MAX_POSTS_PER_FEED=10   # only the newest posts of each feed are converted; 0 means all
+SUMMARY_TO=""           # your own address for a daily summary of what was sent; empty means off
+SUMMARY_HOUR=8          # the summary goes out with the first run at or after this hour (0-23)
 # extra percollate flags; covers are rendered with headless Chrome, so they are off by default
 # (to enable: npx puppeteer browsers install chrome, then set PERCOLLATE_ARGS=())
 PERCOLLATE_ARGS=(--no-cover)
@@ -121,6 +131,8 @@ declare -i SEND_DELAY=30
 declare -i MAX_SENDS_PER_RUN=5
 declare -i MAX_ATTEMPTS=3
 declare -i MAX_POSTS_PER_FEED=10
+declare SUMMARY_TO=''
+declare -i SUMMARY_HOUR=8
 declare -a PERCOLLATE_ARGS=(--no-cover)
 # shellcheck source=/dev/null
 . "${CONF}"
@@ -189,6 +201,64 @@ function read_feeds() {
     done < "${FEEDS}"
 }
 
+# ---- daily summary ---------------------------------------------------------------------
+# A summary covers the posts sent since the previous one: ${SUMMARY_STAMP} holds the day it was
+# mailed and its mtime is the end of the window it covered. The first one covers the last 24 hours.
+
+function summary_hour_ok() { [[ ${SUMMARY_HOUR} -ge 0 && ${SUMMARY_HOUR} -le 23 ]]; }
+
+# summary_due  -> is a summary wanted now and not mailed yet today?
+function summary_due() {
+    [[ -n "${SUMMARY_TO}" ]] || return 1
+    summary_hour_ok || { log "SUMMARY_HOUR=${SUMMARY_HOUR} is not an hour (0-23), no summary"; return 1; }
+    [[ $((10#$(date +%H))) -ge ${SUMMARY_HOUR} ]] || return 1
+    [[ "$(cat "${SUMMARY_STAMP}" 2>/dev/null)" != "$(date +%F)" ]]
+}
+
+# summary_window <dir>  -> <dir>/summary.start and <dir>/summary.now, whose mtimes bound the window.
+# The end is taken before counting, so a send that lands meanwhile falls in the next window.
+function summary_window() {
+    if [[ -f "${SUMMARY_STAMP}" ]]; then
+        cp -p "${SUMMARY_STAMP}" "$1/summary.start"
+    else
+        : > "$1/summary.start"
+        perl -e '$t = time - 86400; utime $t, $t, shift' "$1/summary.start"
+    fi
+    : > "$1/summary.now"
+}
+
+# count_epubs <dir> [find tests...]  -> number of matching *.epub files in <dir>
+function count_epubs() {
+    [[ -d "$1" ]] || { echo 0; return 0; }
+    find "$1" -name '*.epub' "${@:2}" | wc -l | tr -d ' '
+}
+
+declare -i summary_sent=0 summary_queued=0
+
+# summary_report <start> <end>  -> the summary text: per feed, posts sent between the mtimes of
+# <start> and <end> and posts still in the outbox. Totals are left in summary_sent/summary_queued.
+function summary_report() {
+    local start="$1" end="$2" f_url f_author f_slug
+    local -i sent queued
+    summary_sent=0
+    summary_queued=0
+    printf 'docpeyk summary since %s\n\n' \
+        "$(perl -MPOSIX -e 'print strftime("%Y-%m-%d %H:%M", localtime((stat shift)[9]))' "${start}")"
+    printf '%6s %7s  %s\n' sent queued feed
+    # invalid feeds.csv lines are already logged by the run
+    while IFS=$'\x1f' read -r f_url f_author f_slug; do
+        [[ -n "${f_slug}" ]] || continue
+        sent=$(count_epubs "${ROOT}/${f_slug}/sent" -newer "${start}" ! -newer "${end}")
+        queued=$(count_epubs "${ROOT}/${f_slug}/outbox")
+        # ad-hoc pages only get a row when there was something to send
+        [[ "${f_url}" == - && ${sent} -eq 0 && ${queued} -eq 0 ]] && continue
+        printf '%6d %7d  %s\n' "${sent}" "${queued}" "${f_author} (${f_slug})"
+        summary_sent+=sent
+        summary_queued+=queued
+    done < <(read_feeds true; printf -- '-\x1fad-hoc pages\x1f%s\n' "${ADHOC}")
+    printf '%6d %7d  %s\n' "${summary_sent}" "${summary_queued}" total
+}
+
 # ---- doctor ----------------------------------------------------------------------------
 declare -i doctor_fails=0
 
@@ -224,6 +294,16 @@ function doctor() {
         report ok "KINDLE_TO ${KINDLE_TO}"
     else
         report warn "KINDLE_TO ${KINDLE_TO} doesn't look like a Send to Kindle address (...@kindle.com)"
+    fi
+
+    if ! summary_hour_ok; then
+        report FAIL "SUMMARY_HOUR=${SUMMARY_HOUR} is not an hour (0-23)"
+    elif [[ -z "${SUMMARY_TO}" ]]; then
+        report ok "daily summary off (set SUMMARY_TO in ${CONF} to get one)"
+    elif [[ "${SUMMARY_TO}" =~ @(free\.)?kindle\.(com|cn)$ ]]; then
+        report warn "SUMMARY_TO ${SUMMARY_TO} is a Kindle address; the summary is meant for your own mailbox"
+    else
+        report ok "daily summary to ${SUMMARY_TO} after $(printf '%02d' "${SUMMARY_HOUR}"):00"
     fi
 
     if command -v msmtp >/dev/null; then
@@ -284,6 +364,14 @@ function doctor() {
 if [[ ${opt_doctor} -eq 1 ]]; then
     doctor && exit 0
     exit 1
+fi
+
+if [[ ${opt_report} -eq 1 ]]; then
+    report_dir=$(mktemp -d "${TMPDIR:-/tmp}/docpeyk.XXXXXX")
+    summary_window "${report_dir}"
+    summary_report "${report_dir}/summary.start" "${report_dir}/summary.now"
+    rm -rf "${report_dir}"
+    exit 0
 fi
 
 problems=$(dependency_problems)
@@ -581,6 +669,8 @@ function send_outbox() {
 
         if build_mail "${epub}" "${title}" | msmtp -a "${MSMTP_ACCOUNT}" -- "${KINDLE_TO}"; then
             mv "${epub}" "${base}/sent/"
+            # mv keeps the conversion time; the daily summary counts sends by mtime
+            touch "${base}/sent/${epub##*/}"
             log "[${slug}] sent: ${epub##*/}"
             sends_left=$((sends_left - 1))
             sleep "${SEND_DELAY}"
@@ -591,6 +681,32 @@ function send_outbox() {
 
     rm -rf "${lock}"
     unset 'held_locks[${#held_locks[@]}-1]'
+}
+
+# send_summary  -> mails the daily summary to SUMMARY_TO; once it's out, the next window starts now
+function send_summary() {
+    local subject
+    summary_window "${work}"
+    summary_report "${work}/summary.start" "${work}/summary.now" > "${work}/summary.txt"
+    subject="docpeyk: ${summary_sent} sent, ${summary_queued} queued"
+    if {
+        cat <<EOL
+To: ${SUMMARY_TO}
+Subject: ${subject}
+Date: $(LC_ALL=C date '+%a, %d %b %Y %H:%M:%S %z')
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+EOL
+        cat "${work}/summary.txt"
+    } | msmtp -a "${MSMTP_ACCOUNT}" -- "${SUMMARY_TO}"; then
+        date '+%F' > "${SUMMARY_STAMP}"
+        touch -r "${work}/summary.now" "${SUMMARY_STAMP}"
+        log "summary sent to ${SUMMARY_TO}: ${summary_sent} sent, ${summary_queued} queued"
+    else
+        log "failed to send the summary to ${SUMMARY_TO}, will retry next run"
+    fi
 }
 
 # ---- main ------------------------------------------------------------------------------
@@ -640,4 +756,6 @@ if [[ ${opt_send} -eq 1 ]]; then
         fi
     fi
 fi
+# after the sends, so the summary counts this run's too
+if [[ -z "${only_slug}" && ${opt_send} -eq 1 ]] && summary_due; then send_summary; fi
 exit 0
