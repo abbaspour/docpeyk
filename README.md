@@ -28,20 +28,21 @@ that can send through SMTP, and a Kindle. The steps below take about 15 minutes.
 | [percollate](https://github.com/danburzo/percollate) (double "l") on Node >= 14.17 | page → EPUB       |
 | [msmtp](https://marlam.de/msmtp/)                                                  | sending the email |
 | [yq](https://github.com/mikefarah/yq) (mikefarah's), `jq`                          | reading feeds     |
+| [ImageMagick](https://imagemagick.org) 7 (`magick`), `zip`                         | Kindle images     |
 | `curl`, `perl`, `openssl`, `unzip`, `git`                                          | everything else   |
 
-**macOS** (with [Homebrew](https://brew.sh); `jq`, `curl`, `perl`, `openssl` and `unzip` ship
-with macOS):
+**macOS** (with [Homebrew](https://brew.sh); `jq`, `curl`, `perl`, `openssl`, `unzip` and `zip`
+ship with macOS):
 
 ```bash
-brew install msmtp yq node
+brew install msmtp yq node imagemagick
 PUPPETEER_SKIP_DOWNLOAD=1 npm install -g percollate
 ```
 
 **Debian / Ubuntu:**
 
 ```bash
-sudo apt-get install git curl jq unzip msmtp ca-certificates
+sudo apt-get install git curl jq unzip zip imagemagick msmtp ca-certificates
 
 sudo snap install yq     # mikefarah's yq. Not `apt install yq`: that's a different tool
 
@@ -55,14 +56,14 @@ answer *No*: its profile can block the `passwordeval` command used in step 4.
 **Fedora / RHEL:**
 
 ```bash
-sudo dnf install git curl jq unzip msmtp perl-Unicode-Normalize cronie
+sudo dnf install git curl jq unzip zip ImageMagick msmtp perl-Unicode-Normalize cronie
 sudo systemctl enable --now crond
 ```
 
 **Arch:**
 
 ```bash
-sudo pacman -S git curl jq unzip msmtp go-yq cronie     # go-yq is mikefarah's; "yq" is not
+sudo pacman -S git curl jq unzip zip imagemagick msmtp go-yq cronie     # go-yq is mikefarah's; "yq" is not
 sudo systemctl enable --now cronie
 ```
 
@@ -73,6 +74,15 @@ sudo systemctl enable --now cronie
 sudo curl -fsSL -o /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
 sudo chmod +x /usr/local/bin/yq
 yq --version     # must mention mikefarah
+```
+
+**ImageMagick 7:** docpeyk calls `magick`, which ImageMagick 6 doesn't have. Debian 12 and
+Ubuntu 24.04 still package version 6. There, install version 7 from
+[imagemagick.org](https://imagemagick.org/script/download.php), for example its AppImage saved
+as `/usr/local/bin/magick`. Then check:
+
+```bash
+magick -version     # must say ImageMagick 7
 ```
 
 **Node and percollate on Linux:** install Node with [nvm](https://github.com/nvm-sh/nvm), not
@@ -238,6 +248,7 @@ feed order.
 | `msmtp: ... contains secrets and therefore must have no more than user read/write permissions` | `chmod 600 ~/.msmtprc` |
 | `passwordeval` fails with *Permission denied* (Debian, Ubuntu) | AppArmor: `sudo dpkg-reconfigure msmtp` and answer *No*. |
 | TLS or certificate errors from msmtp | Add the `tls_trust_file` line from step 4. Use port 465 with `tls_starttls off` if your provider wants it. |
+| Images show in Apple Books but not on the Kindle | Kindle only shows JPEG, PNG and GIF. docpeyk rewrites other formats, such as WebP and AVIF, as PNG and logs `N image(s) rewritten`. A `WARN: can't read image` or `can't convert` line means ImageMagick couldn't decode that image. Check `magick -list format`. |
 | Sent, but nothing arrives on the Kindle | Check the sender is on Amazon's approved list (step 3). Amazon emails rejections to the sender address. See also *Pending delivery* under Caveats. |
 | Nothing runs on schedule (Linux) | Is the cron daemon running? `crontab -l` should show a line ending in `# docpeyk (managed by install.sh)`. |
 
@@ -373,7 +384,7 @@ tail -f ~/Kindle/docpeyk.log                                   # watch
 ## Development
 
 ```bash
-tests/run.sh               # end-to-end tests with stub percollate/msmtp, no network needed
+tests/run.sh               # end-to-end tests with stub percollate/msmtp/magick, no network needed
 tests/run.sh -b /bin/bash  # same, under macOS's stock bash 3.2
 shellcheck -S warning docpeyk.sh findfeed.sh install.sh tests/run.sh tests/stubs/* tests/stubs-web/*
 ```
