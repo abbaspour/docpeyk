@@ -121,6 +121,12 @@ function pkg_hint() {
     case "$1" in
     percollate) echo "PUPPETEER_SKIP_DOWNLOAD=1 npm install -g percollate"; return 0 ;;
     node) echo "Node >= 14.17, e.g. with https://github.com/nvm-sh/nvm"; return 0 ;;
+    magick)
+        if command -v brew >/dev/null; then echo "brew install imagemagick"
+        elif command -v dnf >/dev/null; then echo "sudo dnf install ImageMagick"
+        elif command -v pacman >/dev/null; then echo "sudo pacman -S imagemagick"
+        else echo "ImageMagick 7 (the magick command), see https://imagemagick.org/script/download.php"; fi
+        return 0 ;;
     yq)
         if command -v brew >/dev/null; then echo "brew install yq"
         else echo "a binary from https://github.com/mikefarah/yq/releases (not your distro's Python yq)"; fi
@@ -179,9 +185,9 @@ if ! command -v percollate >/dev/null && [[ ${opt_dry} -eq 0 ]]; then
 fi
 
 # launchd and cron start jobs with a bare PATH: bake in wherever the tools live now
-# (percollate under nvm/npm, msmtp/yq under Homebrew)
+# (percollate under nvm/npm, msmtp/yq/magick under Homebrew)
 declare -a dirs=()
-for tool in percollate node msmtp yq jq perl curl openssl unzip; do
+for tool in percollate node msmtp yq jq perl curl openssl unzip zip magick; do
     if p=$(command -v "${tool}"); then
         dirs+=("$(dirname "${p}")")
     else

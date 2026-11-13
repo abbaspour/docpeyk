@@ -156,7 +156,11 @@ function dependency_problems() {
     if command -v perl >/dev/null && ! perl -MUnicode::Normalize -e 1 2>/dev/null; then
         echo "perl module Unicode::Normalize not found"
     fi
-    if [[ ${opt_convert} -eq 1 ]] && ! command -v percollate >/dev/null; then echo "percollate not found"; fi
+    if [[ ${opt_convert} -eq 1 ]]; then
+        command -v percollate >/dev/null || echo "percollate not found"
+        command -v zip >/dev/null || echo "zip not found"
+        command -v magick >/dev/null || echo "magick not found (ImageMagick 7)"
+    fi
     if [[ ${opt_send} -eq 1 ]] && ! command -v msmtp >/dev/null; then echo "msmtp not found"; fi
     return 0
 }
@@ -278,7 +282,7 @@ function doctor() {
 
     problems=$(dependency_problems)
     if [[ -z "${problems}" ]]; then
-        report ok "tools: curl jq yq perl openssl unzip percollate msmtp"
+        report ok "tools: curl jq yq perl openssl unzip zip magick percollate msmtp"
     else
         while IFS= read -r line; do report FAIL "${line}"; done <<< "${problems}"
     fi
@@ -486,6 +490,74 @@ EOL
 }
 
 # ---- convert ---------------------------------------------------------------------------
+# kindle_images <epub> <tag>: rewrites, in place, the images Send to Kindle can't show as PNG.
+# Kindle takes JPEG, PNG and GIF and silently drops the rest (WebP, AVIF, ...), while percollate
+# keeps each image as the site serves it. Formats are sniffed rather than taken from the name, as
+# percollate names images from URLs without an extension *.image, with media-type "image".
+# An image magick can't read or convert stays as it is; if unpacking or repacking fails, the whole EPUB does.
+function kindle_images() {
+    local epub="$1" tag="$2" dir="${work}/epub" out="${work}/images.epub"
+    local opf base type href fmt mime ext stem new
+    local -i changed=0
+    rm -rf "${dir}" "${out}"
+    mkdir -p "${dir}"
+    unzip -q "${epub}" -d "${dir}" 2>/dev/null || { log "${tag} WARN: can't unpack the EPUB to check its images"; return 0; }
+    opf=$(cd "${dir}" && find . -name '*.opf' | head -1)
+    [[ -n "${opf}" ]] || return 0
+    base="${dir}/$(dirname "${opf}")"
+
+    # manifest images other than SVG, as "media-type <TAB> href"
+    while IFS=$'\t' read -r type href; do
+        [[ -f "${base}/${href}" ]] || continue
+        if ! fmt=$(magick identify -format '%m\n' "${base}/${href}[0]" 2>/dev/null | head -1) || [[ -z "${fmt}" ]]; then
+            log "${tag} WARN: can't read image ${href}, left as is"
+            continue
+        fi
+        case "${fmt}" in
+        JPEG) mime=image/jpeg; ext=jpg ;;
+        PNG) mime=image/png; ext=png ;;
+        GIF) mime=image/gif; ext=gif ;;
+        *) mime=image/png; ext=png ;;
+        esac
+        [[ "${fmt}" =~ ^(JPEG|PNG|GIF)$ && "${type}" == "${mime}" ]] && continue
+
+        stem="${href}"
+        [[ "${href##*/}" == *.* ]] && stem="${href%.*}"
+        new="${stem}.${ext}"
+        if [[ "${fmt}" =~ ^(JPEG|PNG|GIF)$ ]]; then
+            [[ "${new}" == "${href}" ]] || mv "${base}/${href}" "${base}/${new}"
+        else
+            # first frame only: Kindle has no animated WebP either
+            if ! magick "${base}/${href}[0]" "PNG:${base}/${new}.part" 2>/dev/null; then
+                log "${tag} WARN: can't convert ${fmt} image ${href} to PNG, Kindle won't show it"
+                continue
+            fi
+            rm -f "${base}/${href}"
+            mv "${base}/${new}.part" "${base}/${new}"
+        fi
+        if [[ "${new}" != "${href}" ]]; then
+            OLD="${href##*/}" NEW="${new##*/}" find "${dir}" -type f \
+                \( -name '*.opf' -o -name '*.xhtml' -o -name '*.html' -o -name '*.css' -o -name '*.ncx' \) \
+                -exec perl -pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' {} +
+        fi
+        HREF="${new}" MIME="${mime}" perl -pi -e 's{<item\b[^>]*>}{my $i = $&;
+            $i =~ s/\bmedia-type="[^"]*"/media-type="$ENV{MIME}"/ if $i =~ /\bhref="\Q$ENV{HREF}\E"/; $i}ge' "${dir}/${opf}"
+        vlog "${tag} image ${href}: ${fmt} -> ${new}"
+        changed+=1
+    done < <(perl -ne 'while (/<item\b([^>]*)>/g) { my $attrs = $1;
+        my ($h) = $attrs =~ /\bhref="([^"]*)"/; my ($m) = $attrs =~ /\bmedia-type="([^"]*)"/;
+        print "$m\t$h\n" if defined $h && defined $m && $m =~ m{^image} && $m !~ /svg/ }' "${dir}/${opf}")
+
+    [[ ${changed} -gt 0 ]] || return 0
+    # the EPUB spec wants mimetype first and uncompressed
+    if ! (cd "${dir}" && { [[ ! -f mimetype ]] || zip -X0q "${out}" mimetype; } && zip -X9qrD "${out}" . -x mimetype); then
+        log "${tag} WARN: can't repack the EPUB, images left as they were"
+        return 0
+    fi
+    mv "${out}" "${epub}"
+    log "${tag} ${changed} image(s) rewritten in a format Kindle shows"
+}
+
 # convert_url <url> <title> <author> <YYYY-MM-DD> <folder>  -> path of the new epub on stdout
 # empty title/author let percollate take them from the page; empty date means today
 function convert_url() {
@@ -514,6 +586,7 @@ function convert_url() {
     if [[ -n "${author}" ]]; then
         [[ "$(opf_field "${tmp_epub}" creator)" == "${author}" ]] || log "${tag} WARN: dc:creator mismatch for ${link}"
     fi
+    kindle_images "${tmp_epub}" "${tag}"
 
     [[ -n "${day}" ]] || day=$(date '+%F')
     name=$(slugify "${title}")

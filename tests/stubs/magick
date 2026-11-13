@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# magick (ImageMagick 7) stand-in that tells WebP, PNG and JPEG apart by their first bytes.
+#   magick identify -format '%m\n' <file>[0]  -> WEBP, PNG or JPEG; fails on anything else
+#   magick <file>[0] PNG:<out>                -> writes a stub PNG; fails on unknown input
+
+set -ueo pipefail
+export LC_ALL=C
+
+echo "$*" >> "${STUB_LOG}/magick.calls"
+
+# format <file>[0]  -> its format, or fails
+function format() {
+    local sig
+    sig=$(head -c 12 "${1%\[0\]}" 2>/dev/null) || return 1
+    case "${sig}" in
+    RIFF????WEBP) echo WEBP ;;
+    $'\x89'PNG*) echo PNG ;;
+    $'\xff\xd8\xff'*) echo JPEG ;;
+    *) echo >&2 "identify: no decode delegate for this image format \`${1%\[0\]}'"; return 1 ;;
+    esac
+}
+
+if [[ "${1:-}" == identify ]]; then
+    format "${4:-}"
+else
+    format "${1:-}" >/dev/null
+    printf '\x89PNG stub\n' > "${2#PNG:}"
+fi

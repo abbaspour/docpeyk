@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # percollate stand-in: writes a minimal EPUB without fetching anything.
 # URLs containing "fail" get an EPUB with only nav.xhtml, like a real failed fetch.
+# URLs containing "images" get a WebP, a PNG and an extensionless JPEG (named *.image, with
+# media-type "image", as percollate does); URLs containing "badimage" get a WebP magick can't read.
 
 set -ueo pipefail
 
@@ -26,15 +28,32 @@ function xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/percollate-stub.XXXXXX")
 readonly tmp
 mkdir -p "${tmp}/OEBPS"
+printf 'application/epub+zip' > "${tmp}/mimetype"
+
+# image <name> <media-type> <bytes>: one image, in the manifest and on the page
+declare items='' imgs=''
+function image() {
+    printf "$3" > "${tmp}/OEBPS/$1"
+    items="${items}<item id=\"${1%%.*}\" href=\"$1\" media-type=\"$2\" />"$'\n'
+    imgs="${imgs}<img src=\"./$1\" />"
+}
+if [[ "${url}" == *images* ]]; then
+    image rr-webp.webp image/webp 'RIFFxxxxWEBPVP8 stub'
+    image rr-png.png image/png '\x89PNG stub'
+    image rr-jpeg.image image '\xff\xd8\xff stub'
+fi
+[[ "${url}" != *badimage* ]] || image rr-bad.webp image/webp 'not an image'
+
 cat > "${tmp}/OEBPS/content.opf" <<EOL
 <?xml version="1.0" encoding="UTF-8"?>
 <package xmlns="http://www.idpf.org/2007/opf"><metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
 <dc:title>$(xml_escape "${title}")</dc:title>
 <dc:creator>$(xml_escape "${author}")</dc:creator>
-</metadata></package>
+</metadata><manifest>
+${items}</manifest></package>
 EOL
 echo '<html/>' > "${tmp}/OEBPS/nav.xhtml"
-[[ "${url}" == *fail* ]] || echo '<html/>' > "${tmp}/OEBPS/article.xhtml"
-(cd "${tmp}" && zip -qr article.epub OEBPS)
+[[ "${url}" == *fail* ]] || echo "<html><body>${imgs}</body></html>" > "${tmp}/OEBPS/article.xhtml"
+(cd "${tmp}" && zip -X0q article.epub mimetype && zip -qr article.epub OEBPS)
 mv "${tmp}/article.epub" "${out}"
 rm -rf "${tmp}"

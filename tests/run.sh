@@ -13,7 +13,7 @@ USAGE: $0 [-b bash] [-k] [-h]
         -k             # keep the scratch directory
         -h|?           # usage
 
-End-to-end tests for docpeyk.sh against fixture feeds, with stub percollate,
+End-to-end tests for docpeyk.sh against fixture feeds, with stub percollate, magick,
 msmtp and network checks from tests/stubs (no network access needed).
 
 eg,
@@ -168,6 +168,33 @@ rm -f "${data}"/adhoc/outbox/*.epub
 check "non-http ad-hoc argument is rejected" eval '! docpeyk ftp://example.com/x'
 check "-S with URLs is rejected" eval '! docpeyk -S https://example.com/x'
 
+# ---- images for Kindle -------------------------------------------------------------------
+check "pages without images don't call magick" [ ! -e "${STUB_LOG}/magick.calls" ]
+# a separate data dir, so the counts above stay as they are
+readonly pics="${scratch}/images"
+mkdir -p "${pics}"
+cp "${data}/kindle.conf" "${pics}/"
+function pictured() { "${test_bash}" "${root}/docpeyk.sh" -d "${pics}" -C "$1" 2>"${scratch}/last.log"; }
+# in_epub <command> <entry...>: unzip <command> on the converted page
+function in_epub() { unzip "$1" "${pics}/adhoc/outbox/${today}-page-title.epub" "${@:2}"; }
+
+check "page with WebP, PNG and *.image JPEG converts" pictured https://example.com/images
+check "  2 images rewritten" logged "[adhoc] 2 image(s) rewritten in a format Kindle shows"
+check "  WebP is now PNG, JPEG gets .jpg, PNG untouched" \
+    [ "$(in_epub -Z1 'OEBPS/rr-*' | sort | tr '\n' ' ')" = "OEBPS/rr-jpeg.jpg OEBPS/rr-png.png OEBPS/rr-webp.png " ]
+check "  the WebP was converted" eval 'in_epub -p OEBPS/rr-webp.png | LC_ALL=C grep -q "PNG stub"'
+check "  manifest names and media types" eval 'in_epub -p OEBPS/content.opf | grep -qF "href=\"rr-webp.png\" media-type=\"image/png\"" &&
+    in_epub -p OEBPS/content.opf | grep -qF "href=\"rr-jpeg.jpg\" media-type=\"image/jpeg\""'
+check "  page points at the new files" \
+    [ "$(in_epub -p OEBPS/article.xhtml)" = '<html><body><img src="./rr-webp.png" /><img src="./rr-png.png" /><img src="./rr-jpeg.jpg" /></body></html>' ]
+check "  mimetype stays the first entry" [ "$(in_epub -Z1 | head -1)" = mimetype ]
+check "  and uncompressed" eval 'in_epub -Z mimetype | grep -q " stor "'
+rm -f "${pics}"/adhoc/outbox/*.epub
+check "unreadable image doesn't fail the conversion" pictured https://example.com/badimage
+check "  is logged" logged "[adhoc] WARN: can't read image rr-bad.webp, left as is"
+check "  and left as is" [ "$(in_epub -Z1 'OEBPS/rr-*')" = OEBPS/rr-bad.webp ]
+rm -rf "${pics}"
+
 # ---- dependency checks -------------------------------------------------------------------
 mkdir -p "${scratch}/fake-yq"
 printf '#!/usr/bin/env bash\necho "yq 3.4.3"\n' > "${scratch}/fake-yq/yq"
@@ -175,6 +202,15 @@ chmod +x "${scratch}/fake-yq/yq"
 PATH="${scratch}/fake-yq:${PATH}" "${test_bash}" "${root}/docpeyk.sh" -d "${data}" -C 2>"${scratch}/last.log" && rc=0 || rc=$?
 check "Python yq is rejected with exit 3" [ "${rc}" = 3 ]
 check "Python yq error names mikefarah/yq" logged "yq is not mikefarah/yq"
+# every stub except magick, plus the system tools
+readonly nomagick="${scratch}/no-magick"
+mkdir -p "${nomagick}"
+for s in "${root}"/tests/stubs/*; do [[ "${s##*/}" == magick ]] || ln -s "${s}" "${nomagick}/${s##*/}"; done
+PATH="${nomagick}:/usr/bin:/bin" "${test_bash}" "${root}/docpeyk.sh" -d "${data}" -C 2>"${scratch}/last.log" && rc=0 || rc=$?
+check "missing magick stops a convert run with exit 3" [ "${rc}" = 3 ]
+check "  and says so" logged "error: magick not found (ImageMagick 7)"
+PATH="${nomagick}:/usr/bin:/bin" "${test_bash}" "${root}/docpeyk.sh" -d "${data}" -S 2>"${scratch}/last.log" || true
+check "  a send-only run doesn't need it" eval '! logged "magick not found"'
 
 # ---- MAX_POSTS_PER_FEED ------------------------------------------------------------------
 # a separate data dir, so the counts above stay as they are
@@ -242,7 +278,7 @@ function reported() { grep -qxF -- "$1" "${scratch}/out" || { sed 's/^/     > /'
 
 calls_before=$(calls)
 check "doctor passes on the test setup (warnings only)" doctor_run "${data}"
-check "  tools" reported "ok    tools: curl jq yq perl openssl unzip percollate msmtp"
+check "  tools" reported "ok    tools: curl jq yq perl openssl unzip zip magick percollate msmtp"
 check "  node" reported "ok    node v20.11.1 for ${root}/tests/stubs/percollate"
 check "  odd KINDLE_TO is a warning" \
     reported "warn  KINDLE_TO reader@kindle.example doesn't look like a Send to Kindle address (...@kindle.com)"
