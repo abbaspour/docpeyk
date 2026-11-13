@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# rsvg-convert stand-in: writes a stub PNG to -o and keeps a copy of each input SVG as
+# $STUB_LOG/rsvg-N.svg, so tests can check what it was given.
+
+set -ueo pipefail
+
+declare out='' in=''
+while [[ $# -gt 0 ]]; do
+    case $1 in
+    -o) out=$2; shift 2 ;;
+    -z | -b | -w | -h) shift 2 ;;
+    -*) shift ;;
+    *) in=$1; shift ;;
+    esac
+done
+
+n=$(find "${STUB_LOG}" -name 'rsvg-*.svg' | wc -l | tr -d ' ')
+cp "${in}" "${STUB_LOG}/rsvg-$((n + 1)).svg"
+printf '\x89PNG stub\n' > "${out}"

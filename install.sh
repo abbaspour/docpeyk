@@ -127,6 +127,13 @@ function pkg_hint() {
         elif command -v pacman >/dev/null; then echo "sudo pacman -S imagemagick"
         else echo "ImageMagick 7 (the magick command), see https://imagemagick.org/script/download.php"; fi
         return 0 ;;
+    rsvg-convert)
+        if command -v brew >/dev/null; then echo "brew install librsvg"
+        elif command -v apt-get >/dev/null; then echo "sudo apt-get install librsvg2-bin"
+        elif command -v dnf >/dev/null; then echo "sudo dnf install librsvg2-tools"
+        elif command -v pacman >/dev/null; then echo "sudo pacman -S librsvg"
+        else echo "librsvg (the rsvg-convert command) from your package manager"; fi
+        return 0 ;;
     yq)
         if command -v brew >/dev/null; then echo "brew install yq"
         else echo "a binary from https://github.com/mikefarah/yq/releases (not your distro's Python yq)"; fi
@@ -194,6 +201,12 @@ for tool in percollate node msmtp yq jq perl curl openssl unzip zip magick; do
         warn "${tool} not found on PATH; install it before the first run: $(pkg_hint "${tool}")"
     fi
 done
+# optional: renders SVG diagrams for Kindle
+if p=$(command -v rsvg-convert); then
+    dirs+=("$(dirname "${p}")")
+else
+    warn "rsvg-convert not found (optional, for SVG diagrams in books): $(pkg_hint rsvg-convert)"
+fi
 if command -v yq >/dev/null && [[ "$(yq --version 2>&1)" != *mikefarah* ]]; then
     warn "$(command -v yq) is not mikefarah/yq; docpeyk.sh needs $(pkg_hint yq)"
 fi

@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - run: shellcheck -S warning docpeyk.sh findfeed.sh install.sh tests/run.sh tests/stubs/* tests/stubs-web/*
+      - run: shellcheck -S warning docpeyk.sh findfeed.sh findtoc.sh install.sh tests/run.sh tests/stubs/* tests/stubs-web/*
 
   test:
     strategy:

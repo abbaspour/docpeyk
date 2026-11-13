@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# percollate stand-in: writes a minimal EPUB without fetching anything.
-# URLs containing "fail" get an EPUB with only nav.xhtml, like a real failed fetch.
+# percollate stand-in: writes a minimal EPUB without fetching anything, a chapter per URL
+# (OEBPS/article.xhtml for one URL, OEBPS/chapter-N.xhtml for several). Each call appends its
+# URLs as one line to $STUB_LOG/percollate.calls and its arguments to $STUB_LOG/percollate.args.
+# URLs containing "fail" get no chapter, like a page percollate can't fetch.
 # URLs containing "images" get a WebP, a PNG and an extensionless JPEG (named *.image, with
 # media-type "image", as percollate does); URLs containing "badimage" get a WebP magick can't read.
+# URLs containing "code" get a highlighted code block, with each line wrapped in <div><p>.
+# URLs containing "diagram" get an inline SVG diagram coloured with CSS variables, a 16px icon
+# and an SVG image file.
 
 set -ueo pipefail
 
 declare title='Page Title'
 declare author='Page Author'
 declare out=''
-declare url=''
+declare -a urls=()
 
+echo "$*" >> "${STUB_LOG}/percollate.args"
 shift # "epub"
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -18,10 +24,10 @@ while [[ $# -gt 0 ]]; do
     --author) author=$2; shift 2 ;;
     -o) out=$2; shift 2 ;;
     -*) shift ;;
-    *) url=$1; shift ;;
+    *) urls+=("$1"); shift ;;
     esac
 done
-echo "${url}" >> "${STUB_LOG}/percollate.calls"
+echo "${urls[*]}" >> "${STUB_LOG}/percollate.calls"
 
 function xml_escape() { sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' <<< "$1"; }
 
@@ -31,18 +37,38 @@ mkdir -p "${tmp}/OEBPS"
 printf 'application/epub+zip' > "${tmp}/mimetype"
 
 # image <name> <media-type> <bytes>: one image, in the manifest and on the page
-declare items='' imgs=''
+declare items='' body=''
 function image() {
     printf "$3" > "${tmp}/OEBPS/$1"
     items="${items}<item id=\"${1%%.*}\" href=\"$1\" media-type=\"$2\" />"$'\n'
-    imgs="${imgs}<img src=\"./$1\" />"
+    body="${body}<img src=\"./$1\" />"
 }
-if [[ "${url}" == *images* ]]; then
-    image rr-webp.webp image/webp 'RIFFxxxxWEBPVP8 stub'
-    image rr-png.png image/png '\x89PNG stub'
-    image rr-jpeg.image image '\xff\xd8\xff stub'
-fi
-[[ "${url}" != *badimage* ]] || image rr-bad.webp image/webp 'not an image'
+
+declare -i n=0
+for url in ${urls[@]+"${urls[@]}"}; do
+    [[ "${url}" != *fail* ]] || continue
+    n+=1
+    body="<p>$(xml_escape "${url}")</p>"
+    if [[ "${url}" == *images* ]]; then
+        body=''
+        image rr-webp.webp image/webp 'RIFFxxxxWEBPVP8 stub'
+        image rr-png.png image/png '\x89PNG stub'
+        image rr-jpeg.image image '\xff\xd8\xff stub'
+    fi
+    [[ "${url}" != *badimage* ]] || { body=''; image rr-bad.webp image/webp 'not an image'; }
+    if [[ "${url}" == *code* ]]; then
+        body="${body}<pre><code><div><p><span>a</span></p></div>
+<div><p/></div><div><p>  b</p></div></code></pre>"
+    fi
+    if [[ "${url}" == *diagram* ]]; then
+        body="${body}<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"100%\" viewBox=\"0 0 600 400\" aria-label=\"Flow\"><rect fill=\"var(--_node-fill)\" stroke=\"var(--_line)\"/><text fill=\"var(--x, #123456)\">Hi</text></svg>"
+        body="${body}<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\" height=\"16\" viewBox=\"0 0 16 16\"><path d=\"M0 0\"/></svg>"
+        image rr-pic.svg image/svg+xml '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 90 60"><rect fill="var(--bg)"/></svg>'
+    fi
+    page=article
+    [[ ${#urls[@]} -eq 1 ]] || page="chapter-${n}"
+    echo "<html><body>${body}</body></html>" > "${tmp}/OEBPS/${page}.xhtml"
+done
 
 cat > "${tmp}/OEBPS/content.opf" <<EOL
 <?xml version="1.0" encoding="UTF-8"?>
@@ -53,7 +79,6 @@ cat > "${tmp}/OEBPS/content.opf" <<EOL
 ${items}</manifest></package>
 EOL
 echo '<html/>' > "${tmp}/OEBPS/nav.xhtml"
-[[ "${url}" == *fail* ]] || echo "<html><body>${imgs}</body></html>" > "${tmp}/OEBPS/article.xhtml"
 (cd "${tmp}" && zip -X0q article.epub mimetype && zip -qr article.epub OEBPS)
 mv "${tmp}/article.epub" "${out}"
 rm -rf "${tmp}"

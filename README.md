@@ -29,20 +29,21 @@ that can send through SMTP, and a Kindle. The steps below take about 15 minutes.
 | [msmtp](https://marlam.de/msmtp/)                                                  | sending the email |
 | [yq](https://github.com/mikefarah/yq) (mikefarah's), `jq`                          | reading feeds     |
 | [ImageMagick](https://imagemagick.org) 7 (`magick`), `zip`                         | Kindle images     |
+| `rsvg-convert` from [librsvg](https://gitlab.gnome.org/GNOME/librsvg) (optional)   | Kindle diagrams   |
 | `curl`, `perl`, `openssl`, `unzip`, `git`                                          | everything else   |
 
 **macOS** (with [Homebrew](https://brew.sh); `jq`, `curl`, `perl`, `openssl`, `unzip` and `zip`
 ship with macOS):
 
 ```bash
-brew install msmtp yq node imagemagick
+brew install msmtp yq node imagemagick librsvg
 PUPPETEER_SKIP_DOWNLOAD=1 npm install -g percollate
 ```
 
 **Debian / Ubuntu:**
 
 ```bash
-sudo apt-get install git curl jq unzip zip imagemagick msmtp ca-certificates
+sudo apt-get install git curl jq unzip zip imagemagick librsvg2-bin msmtp ca-certificates
 
 sudo snap install yq     # mikefarah's yq. Not `apt install yq`: that's a different tool
 
@@ -56,14 +57,14 @@ answer *No*: its profile can block the `passwordeval` command used in step 4.
 **Fedora / RHEL:**
 
 ```bash
-sudo dnf install git curl jq unzip zip ImageMagick msmtp perl-Unicode-Normalize cronie
+sudo dnf install git curl jq unzip zip ImageMagick librsvg2-tools msmtp perl-Unicode-Normalize cronie
 sudo systemctl enable --now crond
 ```
 
 **Arch:**
 
 ```bash
-sudo pacman -S git curl jq unzip zip imagemagick msmtp go-yq cronie     # go-yq is mikefarah's; "yq" is not
+sudo pacman -S git curl jq unzip zip imagemagick librsvg msmtp go-yq cronie     # go-yq is mikefarah's; "yq" is not
 sudo systemctl enable --now cronie
 ```
 
@@ -248,6 +249,7 @@ feed order.
 | `msmtp: ... contains secrets and therefore must have no more than user read/write permissions` | `chmod 600 ~/.msmtprc` |
 | `passwordeval` fails with *Permission denied* (Debian, Ubuntu) | AppArmor: `sudo dpkg-reconfigure msmtp` and answer *No*. |
 | TLS or certificate errors from msmtp | Add the `tls_trust_file` line from step 4. Use port 465 with `tls_starttls off` if your provider wants it. |
+| Code blocks or diagrams look wrong on the Kindle | docpeyk turns highlighted code lines into plain lines. It renders SVG diagrams, such as server-rendered Mermaid, as PNG with `rsvg-convert`. Without it, the log says `SVG diagram(s) left as SVG` and the doctor warns: install librsvg (step 1). Blank lines inside code are sometimes lost: percollate drops them before docpeyk sees the page. |
 | Images show in Apple Books but not on the Kindle | Kindle only shows JPEG, PNG and GIF. docpeyk rewrites other formats, such as WebP and AVIF, as PNG and logs `N image(s) rewritten`. A `WARN: can't read image` or `can't convert` line means ImageMagick couldn't decode that image. Check `magick -list format`. |
 | Sent, but nothing arrives on the Kindle | Check the sender is on Amazon's approved list (step 3). Amazon emails rejections to the sender address. See also *Pending delivery* under Caveats. |
 | Nothing runs on schedule (Linux) | Is the cron daemon running? `crontab -l` should show a line ending in `# docpeyk (managed by install.sh)`. |
@@ -270,6 +272,37 @@ Send any web page right away, without adding a feed:
 - An ad-hoc run doesn't wait for a scheduled run to finish. Each folder is sent by only one
   process at a time, so nothing is emailed twice.
 - `adhoc` is reserved; don't use it as a slug in `feeds.csv`.
+
+## Books
+
+For a user guide or docs site that spans many pages, bundle the pages into one EPUB, with a
+chapter per page and a table of contents. `findtoc.sh` lists a site's chapters in reading
+order from the sidebar of a docs page. Give it one page per section you want, review the
+list, then pass it to `docpeyk.sh -b`:
+
+```bash
+./findtoc.sh https://effect.website/docs/v4/onboarding https://effect.website/docs/v4/guides > effect.txt
+$EDITOR effect.txt                            # drop the chapters you don't want, reorder others
+./docpeyk.sh -b "Effect v4" - < effect.txt    # - reads the URLs from stdin
+./docpeyk.sh -b "Effect basics" https://effect.website/docs/v4/onboarding https://effect.website/docs/v4/getting-started/installation
+```
+
+- `findtoc.sh` picks the `<nav>`, `<aside>` or "sidebar" element with the most links under
+  the page's first two folders (`/docs/v4/` above), or under `-p prefix`. It drops fragments
+  and lists each chapter once, at its first appearance. `-t` adds each link's text. It works
+  with sidebars in the page's HTML (Starlight, Docusaurus, Mintlify and similar docs sites),
+  not with ones built by JavaScript after the page loads.
+- In the list, `docpeyk.sh -b ... -` reads the first field of each line and skips blank and
+  `#` lines, so `findtoc.sh -t` output works as is.
+- percollate fetches the pages one at a time, a second apart. A page it can't fetch is left
+  out, with a `WARN`. Links between chapters still point at the website.
+- The book goes to `~/Kindle/books/outbox/YYYY-MM-DD-<title>.epub` and is sent right away,
+  like an ad-hoc page (`-C` converts only, `-a` sets the author). An unsent book is retried by
+  the next scheduled run. Send to Kindle takes emails up to 50 MB, so docpeyk skips books over
+  35 MB (after base64) with a `WARN`. Split a bigger guide into several books.
+- `books` is reserved; don't use it as a slug in `feeds.csv`.
+- If the site has a single-page print view (mdBook's `print.html`, Sphinx's `singlehtml`),
+  sending that one page as an ad-hoc URL works too.
 
 ## Daily summary
 
@@ -307,6 +340,7 @@ docpeyk summary since 2026-11-09 08:12
 ├── docpeyk.log              # log of every run, scheduled or by hand
 ├── .summary                 # day of the last daily summary; its mtime ends the window
 ├── adhoc/{outbox,sent}/     # ad-hoc pages
+├── books/{outbox,sent}/     # books (-b)
 └── <slug>/
     ├── outbox/              # converted, not yet sent
     ├── sent/                # accepted by the SMTP server (kept forever)
@@ -326,6 +360,12 @@ against the EPUB's OPF metadata and a `WARN` is logged on mismatch.
   the feed's content, since many feeds only carry a summary. percollate exits 0 even when
   the page fetch fails, so a conversion only counts if the EPUB actually contains an
   article. A failed conversion is retried on the next run, up to `MAX_ATTEMPTS`.
+- **Kindle fixes:** Send to Kindle shows less than Apple Books does, so every EPUB is
+  rewritten before it's filed:
+  - Images in formats Kindle drops (WebP, AVIF, ...) become PNG (`magick`).
+  - SVG diagrams become PNG (`rsvg-convert`). The site's CSS colour variables are replaced
+    with plain colours first.
+  - Syntax-highlighted code lines, wrapped in `<div>`/`<p>` inside `<pre>`, become plain lines.
 - **Covers** are off (`--no-cover`): percollate renders them with headless Chrome. To get
   generated covers, run `npx puppeteer browsers install chrome` and set
   `PERCOLLATE_ARGS=()` in `kindle.conf`. Any other percollate flags can go in that array too.
@@ -384,14 +424,14 @@ tail -f ~/Kindle/docpeyk.log                                   # watch
 ## Development
 
 ```bash
-tests/run.sh               # end-to-end tests with stub percollate/msmtp/magick, no network needed
+tests/run.sh               # end-to-end tests with stub percollate/msmtp/magick/rsvg-convert, no network needed
 tests/run.sh -b /bin/bash  # same, under macOS's stock bash 3.2
-shellcheck -S warning docpeyk.sh findfeed.sh install.sh tests/run.sh tests/stubs/* tests/stubs-web/*
+shellcheck -S warning docpeyk.sh findfeed.sh findtoc.sh install.sh tests/run.sh tests/stubs/* tests/stubs-web/*
 ```
 
 The tests feed RSS 2.0, Atom and RSS 1.0 fixtures from `tests/fixtures/` through the real
-script, and run `findfeed.sh` against fixture websites in `tests/fixtures/sites/` through a
-`curl` stand-in. They need `zip` for the stub EPUBs. CI runs them on Linux and macOS.
+script, and run `findfeed.sh` and `findtoc.sh` against fixture websites in
+`tests/fixtures/sites/` through a `curl` stand-in. They need `zip` for the stub EPUBs. CI runs them on Linux and macOS.
 
 ## Credits
 

@@ -195,6 +195,80 @@ check "  is logged" logged "[adhoc] WARN: can't read image rr-bad.webp, left as 
 check "  and left as is" [ "$(in_epub -Z1 'OEBPS/rr-*')" = OEBPS/rr-bad.webp ]
 rm -rf "${pics}"
 
+# ---- books -------------------------------------------------------------------------------
+# a separate data dir, so the counts above stay as they are
+readonly shelf="${scratch}/books"
+mkdir -p "${shelf}"
+cp "${data}/kindle.conf" "${shelf}/"
+function book() { "${test_bash}" "${root}/docpeyk.sh" -d "${shelf}" "$@" 2>"${scratch}/last.log"; }
+# in_book <name> <unzip args...>: unzip on books/outbox/<today>-<name>.epub
+function in_book() { unzip "$2" "${shelf}/books/outbox/${today}-$1.epub" "${@:3}"; }
+function last_call() { [[ "$(tail -1 "${STUB_LOG}/percollate.calls")" == "$1" ]]; }
+function one_line() { tr '\n' '|'; }
+
+check "-b without URLs is rejected" eval '! book -b "No Pages"'
+check "-b with -S is rejected" eval '! book -S -b "No Send" https://example.com/x'
+check "three pages make a book" book -C -b "Effect v4" https://example.com/code https://example.com/diagram https://example.com/third
+check "  one EPUB, named after the title" [ "$(cd "${shelf}/books/outbox" && ls)" = "${today}-effect-v4.epub" ]
+check "  one percollate call with every URL, in order" \
+    last_call "https://example.com/code https://example.com/diagram https://example.com/third"
+check "  pages fetched one at a time, under the book's title" \
+    eval 'tail -1 "${STUB_LOG}/percollate.args" | grep -qF -- "--wait=1 --title Effect v4"'
+check "  a chapter per page, in order" eval 'in_book effect-v4 -p OEBPS/chapter-3.xhtml | grep -qF "https://example.com/third"'
+check "  code block lines are plain lines" \
+    eval 'in_book effect-v4 -p OEBPS/chapter-1.xhtml | one_line | grep -qF "<pre><code><span>a</span>||  b</code></pre>"'
+check "  diagram is a PNG image" \
+    eval 'in_book effect-v4 -p OEBPS/chapter-2.xhtml | grep -qF "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"16\"" &&
+    in_book effect-v4 -p OEBPS/chapter-2.xhtml | grep -qF "<img src=\"./rr-svg-chapter-2-1.png\" alt=\"Flow\" />"'
+check "  icon stays SVG" [ "$(in_book effect-v4 -p OEBPS/chapter-2.xhtml | grep -o '<svg' | wc -l | tr -d ' ')" = 1 ]
+check "  diagram and SVG file are in the manifest as PNG" \
+    eval 'in_book effect-v4 -p OEBPS/content.opf | grep -qF "href=\"rr-svg-chapter-2-1.png\" media-type=\"image/png\"" &&
+    in_book effect-v4 -p OEBPS/content.opf | grep -qF "href=\"rr-pic.png\" media-type=\"image/png\""'
+check "  no SVG sources left behind" eval '! in_book effect-v4 -Z1 | grep -qE "\.(svg|orig|alt)$"'
+check "  rsvg-convert got plain colours, the fallback and a font" \
+    eval 'grep -qF "fill=\"#ffffff\" stroke=\"#333333\"" "${STUB_LOG}/rsvg-1.svg" && grep -qF "fill=\"#123456\"" "${STUB_LOG}/rsvg-1.svg" &&
+    grep -qF "font-family=" "${STUB_LOG}/rsvg-1.svg" && ! grep -qF "var(--" "${STUB_LOG}"/rsvg-*.svg'
+check "  logged" logged "[books] 2 SVG diagram(s) rendered as PNG"
+
+check "a page that fails doesn't fail the book" book -C -b "Partial" https://example.com/one https://example.com/fail-two
+check "  warns" logged "[books] WARN: only 1 of 2 page(s) made it into the book:"
+check "  the book is there" [ -f "${shelf}/books/outbox/${today}-partial.epub" ]
+check "no page at all fails the book" eval '! book -C -b "Empty" https://example.com/fail'
+check "  logged" logged "[books] failed to convert Empty"
+
+check "- reads URLs from stdin, first field, skipping comments" \
+    eval 'printf "# chapters\n\nhttps://example.com/s1\tOne\nhttps://example.com/s2\n" | book -C -b "Stdin Book" -'
+check "  both pages" last_call "https://example.com/s1 https://example.com/s2"
+
+rm -f "${shelf}"/books/outbox/*.epub
+mails_before=$(mails)
+check "a book is sent right away" book -b "Sent Book" https://example.com/a https://example.com/b
+check "  mailed" [ "$(mails)" = $((mails_before + 1)) ]
+check "  moved to books/sent" [ -f "${shelf}/books/sent/${today}-sent-book.epub" ]
+export STUB_MSMTP_FAIL=1
+check "book send failure exits 1" eval '! book -b "Later Book" https://example.com/c'
+unset STUB_MSMTP_FAIL
+check "scheduled run retries books/outbox" book -S
+check "  books outbox is empty" [ "$(find "${shelf}/books/outbox" -name '*.epub' | wc -l | tr -d ' ')" = 0 ]
+check "books get a summary row once sent" eval 'book -R > "${scratch}/out"'
+check "  in -R output" grep -qE '^ +2 +0  books \(books\)$' "${scratch}/out"
+
+# without rsvg-convert diagrams stay SVG; only testable where none is installed outside the stubs
+readonly norsvg="${scratch}/no-rsvg"
+mkdir -p "${norsvg}"
+for s in "${root}"/tests/stubs/*; do [[ "${s##*/}" == rsvg-convert ]] || ln -s "${s}" "${norsvg}/${s##*/}"; done
+rsvg_path="${norsvg}:${PATH//${root}\/tests\/stubs:/}"
+if PATH="${rsvg_path}" command -v rsvg-convert >/dev/null; then
+    echo "skip without rsvg-convert: one is installed at $(PATH="${rsvg_path}" command -v rsvg-convert)"
+else
+    PATH="${rsvg_path}" "${test_bash}" "${root}/docpeyk.sh" -d "${shelf}" -C -b "No Rsvg" https://example.com/diagram \
+        2>"${scratch}/last.log" && rc=0 || rc=$?
+    check "without rsvg-convert the book still converts" [ "${rc}" = 0 ]
+    check "  diagrams stay SVG, with a warning" \
+        logged "[books] WARN: 2 SVG diagram(s) left as SVG; install rsvg-convert to show them on Kindle"
+fi
+rm -rf "${shelf}"
+
 # ---- dependency checks -------------------------------------------------------------------
 mkdir -p "${scratch}/fake-yq"
 printf '#!/usr/bin/env bash\necho "yq 3.4.3"\n' > "${scratch}/fake-yq/yq"
@@ -280,6 +354,7 @@ calls_before=$(calls)
 check "doctor passes on the test setup (warnings only)" doctor_run "${data}"
 check "  tools" reported "ok    tools: curl jq yq perl openssl unzip zip magick percollate msmtp"
 check "  node" reported "ok    node v20.11.1 for ${root}/tests/stubs/percollate"
+check "  optional rsvg-convert" reported "ok    rsvg-convert for SVG diagrams"
 check "  odd KINDLE_TO is a warning" \
     reported "warn  KINDLE_TO reader@kindle.example doesn't look like a Send to Kindle address (...@kindle.com)"
 check "  msmtp account, host and from" reported "ok    msmtp account default: host smtp.example, from me@example.com"
@@ -294,7 +369,7 @@ check "  no secrets from msmtp -P" eval '! grep -q password "${scratch}/out"'
 readonly sick="${scratch}/sick"
 mkdir -p "${sick}"
 printf 'KINDLE_TO=""\nMSMTP_ACCOUNT="work"\n' > "${sick}/kindle.conf"
-printf 'https://a.example/feed,A,same\nhttps://b.example/feed,B,same\nhttps://c.example/feed,C,adhoc\n' > "${sick}/feeds.csv"
+printf 'https://a.example/feed,A,same\nhttps://b.example/feed,B,same\nhttps://c.example/feed,C,adhoc\nhttps://d.example/feed,D,books\n' > "${sick}/feeds.csv"
 export STUB_NODE_VERSION=12.22.9
 check "doctor fails on a broken setup" eval '! doctor_run "${sick}"'
 unset STUB_NODE_VERSION
@@ -303,6 +378,7 @@ check "  no KINDLE_TO" reported "FAIL  KINDLE_TO is not set in ${sick}/kindle.co
 check "  unknown msmtp account, in msmtp's words" reported "FAIL  msmtp: account work not found in ${HOME}/.msmtprc"
 check "  duplicate slug" reported "warn  feeds.csv: slug used more than once: same"
 check "  reserved slug" reported "warn  feeds.csv: 'adhoc' is reserved for ad-hoc pages; pick another slug"
+check "  reserved books slug" reported "warn  feeds.csv: 'books' is reserved for books; pick another slug"
 check "  problem count" reported "3 problem(s) to fix"
 export STUB_SMTP_DOWN=1
 printf 'KINDLE_TO="me@kindle.com"\n' > "${sick}/kindle.conf"
@@ -502,6 +578,33 @@ check "  says so" logged "no feed found for https://nofeed.example/"
 check "unreachable site: exits 1" eval '! findfeed https://missing.example/'
 check "  says so" logged "failed to fetch https://missing.example/"
 check "non-http URL is rejected" eval '! findfeed ftp://example.com/'
+
+# ---- findtoc.sh --------------------------------------------------------------------------
+# findtoc <args...>: runs findtoc.sh against tests/fixtures/sites via the curl stub; output in ${scratch}/out
+function findtoc() {
+    PATH="${root}/tests/stubs-web:${PATH}" "${test_bash}" "${root}/findtoc.sh" "$@" >"${scratch}/out" 2>"${scratch}/last.log"
+}
+readonly docs=https://docs.example/docs/v2
+
+check "findtoc -V prints the version" findtoc -V
+check "findtoc version matches docpeyk's" printed "findtoc $(sed -n 's/^readonly VERSION="\(.*\)"$/\1/p' "${root}/docpeyk.sh")"
+check "sidebar chapters in order" findtoc "${docs}/intro"
+check "  under /docs/v2/, without fragments, duplicates, header, page or commented-out navs" printed "$(printf '%s\n' \
+    "${docs}/intro/" "${docs}/getting-started/install" "${docs}/getting-started/first-steps" "${docs}/guides/advanced")"
+check "-t adds the link text" findtoc -t "${docs}/intro"
+check "  entities decoded, tags dropped" grep -qxF "$(printf '%s\t%s' "${docs}/getting-started/install" 'Install & set up')" "${scratch}/out"
+check "two pages: listed in turn, each chapter once, <base href> honoured" findtoc "${docs}/intro" "${docs}/guides/"
+check "  testing is the one new chapter" [ "$(tail -1 "${scratch}/out")" = "${docs}/guides/testing" ]
+check "  5 chapters" [ "$(wc -l < "${scratch}/out" | tr -d ' ')" = 5 ]
+check "-p narrows the prefix" findtoc -p /docs/v2/guides/ "${docs}/intro"
+check "  to the guides" printed "${docs}/guides/advanced"
+check "page without a sidebar: exits 1" eval '! findtoc "${docs}/plain.html"'
+check "  says so" logged "no sidebar with links under /docs/v2/ found in ${docs}/plain.html"
+check "unreachable page: exits 1" eval '! findtoc https://missing.example/docs/'
+check "  says so" logged "ERROR: failed to fetch https://missing.example/docs/"
+check "findtoc rejects non-http URLs" eval '! findtoc ftp://example.com/'
+check "findtoc output feeds docpeyk -b" eval 'findtoc "${docs}/intro" && "${test_bash}" "${root}/docpeyk.sh" -d "${scratch}/toc-book" -C -b "Example Docs" - < "${scratch}/out" 2>"${scratch}/last.log"'
+check "  as one book with 4 chapters" logged "[books] converting Example Docs: 4 page(s)"
 
 echo
 echo "${checks} checks, ${failures} failed"

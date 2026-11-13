@@ -12,10 +12,12 @@ function usage() {
     cat <<END >&2
 USAGE: $0 [-d dir] [-f slug] [-C|-S] [-v|-V|-h]
        $0 [-d dir] [-a author] [-C] [-v] URL...
+       $0 [-d dir] -b title [-a author] [-C] [-v] URL...|-
        $0 [-d dir] -D|-R
         -d dir         # data directory (default ~/Kindle)
         -f slug        # only process the feed with this slug
-        -a author      # author for ad-hoc URLs (default: the page's byline)
+        -a author      # author for ad-hoc URLs and books (default: the page's byline)
+        -b title       # bundle the URLs into one book, a chapter each; - reads them from stdin
         -C             # convert only, don't send
         -S             # send only, don't fetch/convert
         -D             # doctor: check tools, settings, feeds, mail and schedule, then exit
@@ -28,6 +30,8 @@ Without URLs: reads <dir>/feeds.csv (feed_url,author,slug), converts every unsee
 post to <dir>/<slug>/outbox/*.epub and mails up to MAX_SENDS_PER_RUN files from outbox/
 to Kindle, moving sent files to <dir>/<slug>/sent/.
 With URLs: converts each page to <dir>/adhoc/outbox/ and sends it right away.
+With -b: converts all the URLs into one EPUB in <dir>/books/outbox/ and sends it right away.
+findtoc.sh lists the chapters of a docs site; '-' takes the first field of each stdin line.
 With SUMMARY_TO set, the first scheduled run after SUMMARY_HOUR each day mails it a summary:
 posts sent per feed since the last summary, and how many are still queued.
 Settings live in <dir>/kindle.conf.
@@ -37,6 +41,7 @@ eg,
      $0 -f jvns -C
      $0 https://example.com/some-post/
      $0 -a "Paul Graham" https://paulgraham.com/greatwork.html
+     ./findtoc.sh https://effect.website/docs/v4/onboarding | $0 -b "Effect v4" -
      $0 -D
      $0 -R
 END
@@ -56,17 +61,19 @@ function vlog() { [[ ${opt_verbose} -eq 1 ]] && log "$@"; return 0; }
 declare ROOT="${HOME}/Kindle"
 declare only_slug=''
 declare adhoc_author=''
+declare book_title=''
 declare -i opt_convert=1
 declare -i opt_send=1
 declare -i opt_verbose=0
 declare -i opt_doctor=0
 declare -i opt_report=0
 
-while getopts ":d:f:a:CSDRVhv?" opt; do
+while getopts ":d:f:a:b:CSDRVhv?" opt; do
     case ${opt} in
     d) ROOT=${OPTARG} ;;
     f) only_slug=${OPTARG} ;;
     a) adhoc_author=${OPTARG} ;;
+    b) book_title=${OPTARG} ;;
     C) opt_send=0 ;;
     S) opt_convert=0 ;;
     D) opt_doctor=1 ;;
@@ -82,11 +89,19 @@ while getopts ":d:f:a:CSDRVhv?" opt; do
 done
 shift $((OPTIND - 1))
 declare -a adhoc_urls=("$@")
-readonly ROOT only_slug adhoc_author opt_convert opt_send opt_verbose opt_doctor opt_report adhoc_urls
+# -b title -: chapter URLs from stdin, the first field of each line (so findtoc.sh -t output works too)
+if [[ -n "${book_title}" && $# -eq 1 && "$1" == - ]]; then
+    adhoc_urls=()
+    while read -r u _ || [[ -n "${u}" ]]; do
+        [[ -z "${u}" || "${u}" == \#* ]] || adhoc_urls+=("${u}")
+    done
+fi
+readonly ROOT only_slug adhoc_author book_title opt_convert opt_send opt_verbose opt_doctor opt_report adhoc_urls
 
 for u in ${adhoc_urls[@]+"${adhoc_urls[@]}"}; do
     [[ "${u}" =~ ^https?:// ]] || { echo >&2 "ERROR: not an http(s) URL: ${u}"; usage 1; }
 done
+[[ -n "${book_title}" && ${#adhoc_urls[@]} -eq 0 ]] && { echo >&2 "ERROR: -b needs the chapter URLs"; usage 1; }
 [[ ${#adhoc_urls[@]} -gt 0 && ${opt_convert} -eq 0 ]] && { echo >&2 "ERROR: -S can't be combined with URLs"; usage 1; }
 [[ ${#adhoc_urls[@]} -gt 0 && ${opt_doctor} -eq 1 ]] && { echo >&2 "ERROR: -D can't be combined with URLs"; usage 1; }
 [[ ${#adhoc_urls[@]} -gt 0 && ${opt_report} -eq 1 ]] && { echo >&2 "ERROR: -R can't be combined with URLs"; usage 1; }
@@ -97,6 +112,7 @@ readonly LOCK="${ROOT}/.lock"
 readonly LOG_FILE="${ROOT}/docpeyk.log"
 readonly SUMMARY_STAMP="${ROOT}/.summary"
 readonly ADHOC="adhoc"
+readonly BOOKS="books"
 readonly USER_AGENT="docpeyk/${VERSION} (+https://github.com/abbaspour/docpeyk)"
 
 # ---- bootstrap data directory ----------------------------------------------------------
@@ -254,12 +270,12 @@ function summary_report() {
         [[ -n "${f_slug}" ]] || continue
         sent=$(count_epubs "${ROOT}/${f_slug}/sent" -newer "${start}" ! -newer "${end}")
         queued=$(count_epubs "${ROOT}/${f_slug}/outbox")
-        # ad-hoc pages only get a row when there was something to send
+        # ad-hoc pages and books only get a row when there was something to send
         [[ "${f_url}" == - && ${sent} -eq 0 && ${queued} -eq 0 ]] && continue
         printf '%6d %7d  %s\n' "${sent}" "${queued}" "${f_author} (${f_slug})"
         summary_sent+=sent
         summary_queued+=queued
-    done < <(read_feeds true; printf -- '-\x1fad-hoc pages\x1f%s\n' "${ADHOC}")
+    done < <(read_feeds true; printf -- '-\x1fad-hoc pages\x1f%s\n-\x1fbooks\x1f%s\n' "${ADHOC}" "${BOOKS}")
     printf '%6d %7d  %s\n' "${summary_sent}" "${summary_queued}" total
 }
 
@@ -276,7 +292,7 @@ function report() {
 function report_warn_fd3() { report warn "$@" >&3; }
 
 function doctor() {
-    local problems line cfg host from feeds dupes
+    local problems line cfg host from feeds dupes reserved
     local -i scheduled=0
     echo "docpeyk ${VERSION}, data in ${ROOT}"
 
@@ -290,6 +306,11 @@ function doctor() {
         if ! command -v node >/dev/null; then report FAIL "node not found; percollate needs Node >= 14.17"
         elif ! node_version_ok; then report FAIL "percollate needs Node >= 14.17, found $(node --version)"
         else report ok "node $(node --version) for $(command -v percollate)"; fi
+    fi
+    if command -v rsvg-convert >/dev/null; then
+        report ok "rsvg-convert for SVG diagrams"
+    else
+        report warn "rsvg-convert not found (optional): SVG diagrams stay SVG, which Kindle may not show; it comes with librsvg"
     fi
 
     if [[ -z "${KINDLE_TO}" ]]; then
@@ -341,9 +362,11 @@ function doctor() {
         report ok "feeds.csv: $(grep -c . <<< "${feeds}") feed(s)"
         dupes=$(cut -d $'\x1f' -f3 <<< "${feeds}" | sort | uniq -d | paste -sd, -)
         [[ -z "${dupes}" ]] || report warn "feeds.csv: slug used more than once: ${dupes}"
-        if cut -d $'\x1f' -f3 <<< "${feeds}" | grep -qx "${ADHOC}"; then
-            report warn "feeds.csv: '${ADHOC}' is reserved for ad-hoc pages; pick another slug"
-        fi
+        for reserved in "${ADHOC}:ad-hoc pages" "${BOOKS}:books"; do
+            if cut -d $'\x1f' -f3 <<< "${feeds}" | grep -qx "${reserved%%:*}"; then
+                report warn "feeds.csv: '${reserved%%:*}' is reserved for ${reserved#*:}; pick another slug"
+            fi
+        done
     fi
 
     if command -v launchctl >/dev/null && launchctl print "gui/$(id -u)/${LABEL}" >/dev/null 2>&1; then
@@ -489,26 +512,69 @@ def atomlink: arr | (map(select(type == "object" and (.["+@rel"] == null or .["+
 EOL
 }
 
-# ---- convert ---------------------------------------------------------------------------
-# kindle_images <epub> <tag>: rewrites, in place, the images Send to Kindle can't show as PNG.
-# Kindle takes JPEG, PNG and GIF and silently drops the rest (WebP, AVIF, ...), while percollate
-# keeps each image as the site serves it. Formats are sniffed rather than taken from the name, as
-# percollate names images from URLs without an extension *.image, with media-type "image".
-# An image magick can't read or convert stays as it is; if unpacking or repacking fails, the whole EPUB does.
-function kindle_images() {
-    local epub="$1" tag="$2" dir="${work}/epub" out="${work}/images.epub"
-    local opf base type href fmt mime ext stem new
-    local -i changed=0
-    rm -rf "${dir}" "${out}"
+# ---- Kindle fixes ----------------------------------------------------------------------
+# Send to Kindle shows less than Apple Books does, so every EPUB goes through these passes before
+# it is filed. kindle_fixes unpacks it once; each pass edits the unpacked copy and adds what it
+# changed to ${changes}, kindle_fixes' local (bash's dynamic scoping makes it visible to them).
+# The EPUB is repacked only when something changed, and is left as it was when that fails.
+
+# kindle_fixes <epub> <tag>
+function kindle_fixes() {
+    local epub="$1" tag="$2" dir="${work}/epub" out="${work}/fixed.epub" opf base
+    local -i changes=0
+    rm -rf "${dir:?}" "${out:?}"
     mkdir -p "${dir}"
-    unzip -q "${epub}" -d "${dir}" 2>/dev/null || { log "${tag} WARN: can't unpack the EPUB to check its images"; return 0; }
+    unzip -q "${epub}" -d "${dir}" 2>/dev/null || { log "${tag} WARN: can't unpack the EPUB to fix it for Kindle"; return 0; }
     opf=$(cd "${dir}" && find . -name '*.opf' | head -1)
     [[ -n "${opf}" ]] || return 0
-    base="${dir}/$(dirname "${opf}")"
+    opf="${dir}/${opf#./}"
+    base=$(dirname "${opf}")
 
-    # manifest images other than SVG, as "media-type <TAB> href"
+    fix_svg "${dir}" "${opf}" "${base}" "${tag}"
+    fix_images "${dir}" "${opf}" "${base}" "${tag}"
+    fix_code "${dir}" "${tag}"
+
+    [[ ${changes} -gt 0 ]] || return 0
+    # the EPUB spec wants mimetype first and uncompressed
+    if ! (cd "${dir}" && { [[ ! -f mimetype ]] || zip -X0q "${out}" mimetype; } && zip -X9qrD "${out}" . -x mimetype); then
+        log "${tag} WARN: can't repack the EPUB, left as percollate made it"
+        return 0
+    fi
+    mv "${out}" "${epub}"
+}
+
+# pages <dir>  -> the (X)HTML files of an unpacked EPUB, NUL-separated
+function pages() { find "$1" -type f \( -name '*.xhtml' -o -name '*.html' \) -print0; }
+
+# manifest_images <opf>  -> "media-type <TAB> href" of each image in the manifest
+function manifest_images() {
+    perl -ne 'while (/<item\b([^>]*)>/g) { my $attrs = $1;
+        my ($h) = $attrs =~ /\bhref="([^"]*)"/; my ($m) = $attrs =~ /\bmedia-type="([^"]*)"/;
+        print "$m\t$h\n" if defined $h && defined $m && $m =~ m{^image} }' "$1"
+}
+
+# rename_image <dir> <opf> <href> <new href> <media-type>: gives a manifest image a new name and
+# type, updating every reference. Names are percollate's unique rr-<uuid>.*, so replacing text is safe.
+function rename_image() {
+    local dir="$1" opf="$2" href="$3" new="$4" mime="$5"
+    if [[ "${new}" != "${href}" ]]; then
+        OLD="${href##*/}" NEW="${new##*/}" find "${dir}" -type f \
+            \( -name '*.opf' -o -name '*.xhtml' -o -name '*.html' -o -name '*.css' -o -name '*.ncx' \) \
+            -exec perl -pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' {} +
+    fi
+    HREF="${new}" MIME="${mime}" perl -pi -e 's{<item\b[^>]*>}{my $i = $&;
+        $i =~ s/\bmedia-type="[^"]*"/media-type="$ENV{MIME}"/ if $i =~ /\bhref="\Q$ENV{HREF}\E"/; $i}ge' "${opf}"
+}
+
+# fix_images <dir> <opf> <base> <tag>: images Kindle can't show, as PNG. Kindle takes JPEG, PNG and
+# GIF and silently drops the rest (WebP, AVIF, ...), while percollate keeps each image as the site
+# serves it. Formats are sniffed rather than taken from the name, as percollate names images from
+# URLs without an extension *.image, with media-type "image". SVG is left to fix_svg.
+function fix_images() {
+    local dir="$1" opf="$2" base="$3" tag="$4" type href fmt mime ext stem new
+    local -i n=0
     while IFS=$'\t' read -r type href; do
-        [[ -f "${base}/${href}" ]] || continue
+        [[ "${type}" != image/svg+xml && -f "${base}/${href}" ]] || continue
         if ! fmt=$(magick identify -format '%m\n' "${base}/${href}[0]" 2>/dev/null | head -1) || [[ -z "${fmt}" ]]; then
             log "${tag} WARN: can't read image ${href}, left as is"
             continue
@@ -532,32 +598,181 @@ function kindle_images() {
                 log "${tag} WARN: can't convert ${fmt} image ${href} to PNG, Kindle won't show it"
                 continue
             fi
-            rm -f "${base}/${href}"
+            rm -f "${base:?}/${href:?}"
             mv "${base}/${new}.part" "${base}/${new}"
         fi
-        if [[ "${new}" != "${href}" ]]; then
-            OLD="${href##*/}" NEW="${new##*/}" find "${dir}" -type f \
-                \( -name '*.opf' -o -name '*.xhtml' -o -name '*.html' -o -name '*.css' -o -name '*.ncx' \) \
-                -exec perl -pi -e 's/\Q$ENV{OLD}\E/$ENV{NEW}/g' {} +
-        fi
-        HREF="${new}" MIME="${mime}" perl -pi -e 's{<item\b[^>]*>}{my $i = $&;
-            $i =~ s/\bmedia-type="[^"]*"/media-type="$ENV{MIME}"/ if $i =~ /\bhref="\Q$ENV{HREF}\E"/; $i}ge' "${dir}/${opf}"
+        rename_image "${dir}" "${opf}" "${href}" "${new}" "${mime}"
         vlog "${tag} image ${href}: ${fmt} -> ${new}"
-        changed+=1
-    done < <(perl -ne 'while (/<item\b([^>]*)>/g) { my $attrs = $1;
-        my ($h) = $attrs =~ /\bhref="([^"]*)"/; my ($m) = $attrs =~ /\bmedia-type="([^"]*)"/;
-        print "$m\t$h\n" if defined $h && defined $m && $m =~ m{^image} && $m !~ /svg/ }' "${dir}/${opf}")
-
-    [[ ${changed} -gt 0 ]] || return 0
-    # the EPUB spec wants mimetype first and uncompressed
-    if ! (cd "${dir}" && { [[ ! -f mimetype ]] || zip -X0q "${out}" mimetype; } && zip -X9qrD "${out}" . -x mimetype); then
-        log "${tag} WARN: can't repack the EPUB, images left as they were"
-        return 0
-    fi
-    mv "${out}" "${epub}"
-    log "${tag} ${changed} image(s) rewritten in a format Kindle shows"
+        n+=1
+    done < <(manifest_images "${opf}")
+    [[ ${n} -eq 0 ]] || log "${tag} ${n} image(s) rewritten in a format Kindle shows"
+    changes+=n
 }
 
+# Perl for fix_svg, in a function so bash 3.2 doesn't trip over its quotes:
+#   count <file>...          -> number of diagrams (inline <svg> other than small icons)
+#   extract <prefix> <file>  -> swaps each diagram for a <!--docpeyk-svg:NAME--> marker, saving
+#                               NAME.svg (for rsvg-convert), NAME.orig and NAME.alt next to the file
+#   restore <file>           -> each marker becomes an <img> of NAME.png if it exists, else the original
+#   file <in> <out>          -> an SVG image file, ready for rsvg-convert
+function svg_pl() {
+    cat <<'EOL'
+use strict; use warnings;
+sub slurp { my $f = shift; open my $fh, "<", $f or return ""; local $/; my $s = <$fh>; return $s // "" }
+sub spit { my ($f, $s) = @_; open my $fh, ">", $f or die "$f: $!"; print $fh $s; close $fh }
+
+# CSS variables come from the site's stylesheet, which the EPUB doesn't have: use the fallback
+# when there is one, else white for fills and backgrounds and dark grey for lines and text
+sub plain { my $s = shift;
+    $s =~ s/(font-family\s*(?:=\s*["\x27]|:)\s*)var\(--[^)]*\)/${1}Helvetica, Arial, sans-serif/g;
+    1 while $s =~ s/var\(--[\w-]+\s*,\s*([^()]*)\)/$1/g;
+    $s =~ s/var\(--([\w-]+)\)/$1 =~ m{fill|bg|background|surface|canvas}i ? "#ffffff" : "#333333"/ge;
+    $s =~ s/<svg\b(?![^>]*\sxmlns=)/<svg xmlns="http:\/\/www.w3.org\/2000\/svg"/;
+    $s =~ s/<svg\b(?![^>]*\sfont-family=)/<svg font-family="Helvetica, Arial, sans-serif"/;
+    return $s }
+
+# icons: width or height under 32, from the attributes or else the viewBox
+sub small { my $t = shift; my %a;
+    while ($t =~ /([\w:-]+)\s*=\s*"([^"]*)"/g) { $a{lc $1} = $2 }
+    my ($w, $h) = map { defined $_ && /^\s*([\d.]+)\s*(?:px)?\s*$/ ? $1 : undef } @a{qw(width height)};
+    if ((!defined $w || !defined $h) && ($a{viewbox} // "") =~ /^\s*[-\d.]+[\s,]+[-\d.]+[\s,]+([\d.]+)[\s,]+([\d.]+)/) {
+        $w //= $1; $h //= $2 }
+    return defined $w && defined $h && ($w < 32 || $h < 32) }
+
+sub alt { my $s = shift; my $a = "";
+    if ($s =~ /^<svg\b[^>]*\saria-label="([^"]*)"/) { $a = $1 } elsif ($s =~ m{<title\b[^>]*>([^<]*)</title>}) { $a = $1 }
+    $a =~ s/\s+/ /g; $a =~ s/^ | $//g; $a =~ s/"/&quot;/g;
+    return $a eq "" ? "diagram" : $a }
+
+my $mode = shift;
+if ($mode eq "count") {
+    my $n = 0;
+    for my $f (@ARGV) { my $x = slurp($f); while ($x =~ /(<svg\b[^>]*>)/g) { $n++ unless small($1) } }
+    print "$n\n";
+} elsif ($mode eq "extract") {
+    my ($prefix, $f) = @ARGV; my ($dir) = $f =~ m{^(.*)/}; my $i = 0; my $x = slurp($f);
+    $x =~ s{(<svg\b[^>]*>.*?</svg>)}{ my $s = $1; my ($t) = $s =~ /^(<svg\b[^>]*>)/;
+        if (small($t)) { $s } else { my $name = $prefix . "-" . ++$i;
+            spit("$dir/$name.svg", plain($s)); spit("$dir/$name.orig", $s); spit("$dir/$name.alt", alt($s));
+            "<!--docpeyk-svg:$name-->" } }gse;
+    spit($f, $x) if $i;
+    print "$i\n";
+} elsif ($mode eq "restore") {
+    my ($f) = @ARGV; my ($dir) = $f =~ m{^(.*)/}; my $x = slurp($f);
+    $x =~ s{<!--docpeyk-svg:([\w.-]+)-->}{ -e "$dir/$1.png" ? qq{<img src="./$1.png" alt="} . slurp("$dir/$1.alt") . qq{" />}
+        : slurp("$dir/$1.orig") }ge;
+    spit($f, $x);
+} elsif ($mode eq "file") {
+    spit($ARGV[1], plain(slurp($ARGV[0])));
+}
+EOL
+}
+
+# fix_svg <dir> <opf> <base> <tag>: SVG diagrams as PNG. Kindle's SVG support is patchy, and
+# server-rendered diagrams (Mermaid, ...) take their colours from the site's CSS variables, so
+# without the site's stylesheet they come out as black boxes. Inline diagrams and SVG image files
+# are rendered with rsvg-convert, which is optional: without it they stay SVG.
+function fix_svg() {
+    local dir="$1" opf="$2" base="$3" tag="$4" page folder prefix svg name rel href type stem
+    local -i n=0 found
+    local -a files=()
+    while IFS= read -r -d '' page; do files+=("${page}"); done < <(pages "${dir}")
+
+    if ! command -v rsvg-convert >/dev/null; then
+        found=$(manifest_images "${opf}" | grep -c '^image/svg+xml' || true)
+        [[ ${#files[@]} -eq 0 ]] || found+=$(perl -e "$(svg_pl)" count "${files[@]}")
+        [[ ${found} -eq 0 ]] || log "${tag} WARN: ${found} SVG diagram(s) left as SVG; install rsvg-convert to show them on Kindle"
+        return 0
+    fi
+
+    for page in ${files[@]+"${files[@]}"}; do
+        # diagrams are named after their page: rr-svg-<page>-<n>.png
+        prefix="${page##*/}"
+        prefix="rr-svg-${prefix%.*}"
+        prefix="${prefix//[^A-Za-z0-9_-]/_}"
+        [[ "$(perl -e "$(svg_pl)" extract "${prefix}" "${page}")" != 0 ]] || continue
+        folder="${page%/*}"
+        for svg in "${folder}/${prefix}-"*.svg; do
+            name="${svg##*/}"
+            name="${name%.svg}"
+            if rsvg-convert -z 2 -b white -o "${folder}/${name}.png" "${svg}" 2>/dev/null; then
+                rel="${folder#"${base}"}"
+                rel="${rel#/}"
+                href="${rel}${rel:+/}${name}.png"
+                ID="${name}" HREF="${href}" perl -0pi -e \
+                    's{</manifest>}{<item id="$ENV{ID}" href="$ENV{HREF}" media-type="image/png" />\n</manifest>}' "${opf}"
+                n+=1
+            else
+                rm -f "${folder:?}/${name:?}.png"
+                log "${tag} WARN: can't render an SVG diagram in ${page##*/}, left as SVG"
+            fi
+        done
+        perl -e "$(svg_pl)" restore "${page}"
+        rm -f "${folder:?}/${prefix:?}-"*.svg "${folder:?}/${prefix:?}-"*.orig "${folder:?}/${prefix:?}-"*.alt
+    done
+
+    while IFS=$'\t' read -r type href; do
+        [[ "${type}" == image/svg+xml && -f "${base}/${href}" ]] || continue
+        stem="${href}"
+        [[ "${href##*/}" == *.* ]] && stem="${href%.*}"
+        if perl -e "$(svg_pl)" file "${base}/${href}" "${work}/plain.svg" \
+            && rsvg-convert -z 2 -b white -o "${base}/${stem}.png" "${work}/plain.svg" 2>/dev/null; then
+            rm -f "${base:?}/${href:?}"
+            rename_image "${dir}" "${opf}" "${href}" "${stem}.png" image/png
+            n+=1
+        else
+            rm -f "${base:?}/${stem:?}.png"
+            log "${tag} WARN: can't render SVG image ${href}, left as SVG"
+        fi
+    done < <(manifest_images "${opf}")
+
+    [[ ${n} -eq 0 ]] || log "${tag} ${n} SVG diagram(s) rendered as PNG"
+    changes+=n
+}
+
+# Perl for fix_code: rewrites the <pre> blocks of the given files in place; prints how many changed.
+# Syntax highlighters wrap each code line in <div>/<p> elements inside <pre>, which Kindle lays out
+# as paragraphs, with spacing or indents. Each top-level wrapper becomes a plain line instead.
+function code_pl() {
+    cat <<'EOL'
+use strict; use warnings;
+sub lines { my $b = shift; my ($out, $depth, $lines) = ("", 0, 0);
+    for my $tok (split /(<[^>]+>)/, $b) {
+        if ($tok =~ m{^<(?:div|p)\b[^>]*?(/?)>$}i) {
+            $out .= "\n" if $depth == 0 && $lines++;
+            $depth++ unless $1;
+            next }
+        if ($tok =~ m{^</(?:div|p)\s*>$}i) { $depth-- if $depth > 0; next }
+        next if $depth == 0 && $lines && $tok =~ /^\s*$/;   # whitespace between line wrappers
+        $out .= $tok }
+    return $out }
+
+my $n = 0;
+for my $f (@ARGV) {
+    open my $in, "<", $f or next; my $x = do { local $/; <$in> }; close $in;
+    my $c = 0;
+    $x =~ s{(<pre\b[^>]*>)(.*?)(</pre>)}{ my ($o, $b, $e) = ($1, $2, $3);
+        if ($b =~ /<(?:div|p)\b/i) { $b = lines($b); $c++ } "$o$b$e" }gse;
+    next unless $c;
+    open my $out, ">", $f or die "$f: $!"; print $out $x; close $out;
+    $n += $c;
+}
+print "$n\n";
+EOL
+}
+
+# fix_code <dir> <tag>: code blocks as plain lines (see code_pl)
+function fix_code() {
+    local dir="$1" tag="$2" page
+    local -i n=0
+    local -a files=()
+    while IFS= read -r -d '' page; do files+=("${page}"); done < <(pages "${dir}")
+    [[ ${#files[@]} -eq 0 ]] || n=$(perl -e "$(code_pl)" "${files[@]}") || n=0
+    [[ ${n} -eq 0 ]] || vlog "${tag} ${n} code block(s) flattened"
+    changes+=n
+}
+
+# ---- convert ---------------------------------------------------------------------------
 # convert_url <url> <title> <author> <YYYY-MM-DD> <folder>  -> path of the new epub on stdout
 # empty title/author let percollate take them from the page; empty date means today
 function convert_url() {
@@ -586,13 +801,50 @@ function convert_url() {
     if [[ -n "${author}" ]]; then
         [[ "$(opf_field "${tmp_epub}" creator)" == "${author}" ]] || log "${tag} WARN: dc:creator mismatch for ${link}"
     fi
-    kindle_images "${tmp_epub}" "${tag}"
+    kindle_fixes "${tmp_epub}" "${tag}"
 
     [[ -n "${day}" ]] || day=$(date '+%F')
     name=$(slugify "${title}")
     [[ -n "${name}" ]] || name=$(short_hash "${link}")
     name="${day}-${name}"
     [[ -e "${base}/outbox/${name}.epub" || -e "${base}/sent/${name}.epub" ]] && name="${name}-$(short_hash "${link}")"
+    out="${base}/outbox/${name}.epub"
+    mv "${tmp_epub}" "${out}"
+    printf '%s\n' "${out}"
+}
+
+# convert_book <title> <author> <folder> <url>...  -> path of the new epub on stdout
+# one EPUB with a chapter per URL, in order; an empty author lets percollate take the first page's.
+# Pages are fetched one at a time (--wait), to go easy on the site.
+function convert_book() {
+    local title="$1" author="$2" base="$3"
+    shift 3
+    local tag="[${base##*/}]" tmp_epub="${work}/book.epub" name out
+    local -i chapters
+    local -a meta=(--title "${title}")
+    [[ -n "${author}" ]] && meta+=(--author "${author}")
+
+    log "${tag} converting ${title}: $# page(s)"
+    rm -f "${tmp_epub}"
+    if ! percollate epub ${PERCOLLATE_ARGS[@]+"${PERCOLLATE_ARGS[@]}"} --wait=1 "${meta[@]}" \
+            -o "${tmp_epub}" "$@" </dev/null >"${work}/percollate.log" 2>&1 \
+        || ! has_article "${tmp_epub}"; then
+        { grep -v '^ *at ' "${work}/percollate.log" || true; } | head -10 \
+            | while IFS= read -r line; do log "    ${line}"; done
+        return 1
+    fi
+    chapters=$(unzip -Z1 "${tmp_epub}" | awk '/^OEBPS\/.*\.xhtml$/ && !/\/nav\.xhtml$/' | wc -l)
+    if [[ ${chapters} -lt $# ]]; then
+        log "${tag} WARN: only ${chapters} of $# page(s) made it into the book:"
+        { grep -iE 'error|fail' "${work}/percollate.log" | grep -v '^ *at ' || true; } | head -10 \
+            | while IFS= read -r line; do log "    ${line}"; done
+    fi
+    kindle_fixes "${tmp_epub}" "${tag}"
+
+    name=$(slugify "${title}")
+    [[ -n "${name}" ]] || name=$(short_hash "${title}")
+    name="$(date '+%F')-${name}"
+    [[ -e "${base}/outbox/${name}.epub" || -e "${base}/sent/${name}.epub" ]] && name="${name}-$(short_hash "$*")"
     out="${base}/outbox/${name}.epub"
     mv "${tmp_epub}" "${out}"
     printf '%s\n' "${out}"
@@ -790,15 +1042,22 @@ fi
 
 if [[ ${#adhoc_urls[@]} -gt 0 ]]; then
     declare -i rc=0
-    mkdir -p "${ROOT}/${ADHOC}/outbox" "${ROOT}/${ADHOC}/sent"
-    for u in "${adhoc_urls[@]}"; do
-        convert_url "${u}" '' "${adhoc_author}" '' "${ROOT}/${ADHOC}" >/dev/null \
-            || { log "[${ADHOC}] failed to convert ${u}"; rc=1; }
-    done
+    folder="${ADHOC}"
+    [[ -z "${book_title}" ]] || folder="${BOOKS}"
+    mkdir -p "${ROOT}/${folder}/outbox" "${ROOT}/${folder}/sent"
+    if [[ -n "${book_title}" ]]; then
+        convert_book "${book_title}" "${adhoc_author}" "${ROOT}/${folder}" "${adhoc_urls[@]}" >/dev/null \
+            || { log "[${folder}] failed to convert ${book_title}"; rc=1; }
+    else
+        for u in "${adhoc_urls[@]}"; do
+            convert_url "${u}" '' "${adhoc_author}" '' "${ROOT}/${folder}" >/dev/null \
+                || { log "[${folder}] failed to convert ${u}"; rc=1; }
+        done
+    fi
     if [[ ${opt_send} -eq 1 ]]; then
         [[ -n "${KINDLE_TO}" ]] || { log "KINDLE_TO is not set in ${CONF}, not sending"; exit 1; }
-        send_outbox "${ADHOC}" 0
-        compgen -G "${ROOT}/${ADHOC}/outbox/*.epub" >/dev/null && rc=1
+        send_outbox "${folder}" 0
+        compgen -G "${ROOT}/${folder}/outbox/*.epub" >/dev/null && rc=1
     fi
     exit ${rc}
 fi
@@ -813,8 +1072,9 @@ while IFS=$'\x1f' read -r f_url f_author f_slug; do
     if [[ ${opt_convert} -eq 1 ]]; then convert_feed "${f_url}" "${f_author}" "${f_slug}"; fi
 done <<< "${feed_list}"
 
-# ad-hoc pages whose immediate send failed are retried by the scheduled run
+# ad-hoc pages and books whose immediate send failed are retried by the scheduled run
 [[ -z "${only_slug}" && -d "${ROOT}/${ADHOC}/outbox" ]] && slugs+=("${ADHOC}")
+[[ -z "${only_slug}" && -d "${ROOT}/${BOOKS}/outbox" ]] && slugs+=("${BOOKS}")
 
 [[ ${#slugs[@]} -eq 0 ]] && { vlog "no feeds configured in ${FEEDS}"; exit 0; }
 
